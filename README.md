@@ -1,8 +1,8 @@
 # AI 大模型评测平台 / AI Model Evaluation Platform
 
 > **上线部署 / Deploy:** 请先阅读 [DEPLOY.md](./DEPLOY.md)（Docker Compose 一键启动）  
-> **技术栈 / Stack:** Java 21 · Spring Boot 3.5 · Spring AI · Vue 3 · MySQL · Redis · RabbitMQ  
-> **上游参考 / Upstream:** [yuyuanweb/ai-test](https://github.com/yuyuanweb/ai-test)（本仓库在其 Java 版基础上做了生产加固）
+> **技术栈 / Stack:** **仅 Java** · Spring Boot 3.5 · Spring AI · Vue 3 · MySQL · Redis · RabbitMQ  
+> **上游参考 / Upstream:** [yuyuanweb/ai-test](https://github.com/yuyuanweb/ai-test)（本仓库只保留 Java 后端，已移除 Go / Python）
 
 ---
 
@@ -12,26 +12,37 @@
 企业级 AI 大模型评测平台：多模型并排对比、Prompt Lab、Battle 匿名对战、场景化批量测试、可视化报告与成本监控。通过 OpenRouter 接入 100+ 模型，支持 SSE 流式输出。本仓库面向可上线部署：密钥环境变量化、Docker 内网代理修正、Compose 健康检查与数据持久化。
 
 **English**  
-An enterprise-style AI model evaluation platform: side-by-side multi-model comparison, Prompt Lab, anonymous Battle mode, scenario batch testing, visual reports, and cost monitoring. Models are accessed via OpenRouter with SSE streaming. This fork hardens the Java/Spring stack for production: secrets via env vars, fixed Docker Nginx proxying, Compose health checks, and persistent volumes.
+An enterprise-style AI model evaluation platform: side-by-side multi-model comparison, Prompt Lab, anonymous Battle mode, scenario batch testing, visual reports, and cost monitoring. Models are accessed via OpenRouter with SSE streaming. This fork keeps the Java/Spring stack only and hardens it for production.
 
 ---
 
-## 当前进度 / Current Status
+## 分阶段进度 / Phased Roadmap
+
+| 阶段 Phase | 内容 Scope | 状态 Status |
+|------------|------------|-------------|
+| 1 | 只保留 Java 后端，移除 Go / Python | **本提交** In this commit |
+| 2 | 无 API Key 的 Mock 演示模式 | 进行中 / Next |
+| 3 | 本地上传（不依赖腾讯云 COS） | 待做 / Planned |
+| 4 | 接入真实 OpenRouter API Key | 最后做 / Last |
+| 5 | 公网域名 + HTTPS | 待做 / Planned |
+
+---
+
+## 当前能力说明 / What’s already there
 
 | 模块 Module | 状态 Status | 说明 Notes |
 |-------------|-------------|------------|
-| 前端 Frontend (Vue 3) | 已有完整实现 Inherited complete | 来自上游；本阶段未重写 UI |
-| 后端 Backend (Spring Boot) | 已有完整实现 Inherited complete | 来自上游；非从零 MVP |
-| 生产部署 Production deploy | **本仓库已完成** Done here | 密钥外置、Compose、DEPLOY 文档 |
-| OpenRouter API Key | 待你配置 Pending | 写入 `.env` 后即可调模型 |
-| 公网域名 / HTTPS | 未做 Not yet | 下一步可选 |
+| 前端 Frontend (Vue 3) | 上游完整 Inherited | 本阶段未重写 UI |
+| 后端 Backend (Spring Boot) | 上游完整 Inherited | Java only |
+| 生产部署 Docker Compose | 已加固 Hardened | 见 DEPLOY.md |
+| OpenRouter API Key | 暂缓 Deferred | 先不接真实大模型 |
 
 ---
 
 ## 快速启动 / Quick Start
 
 ```bash
-cp .env.example .env   # 填入 OPENROUTER_API_KEY
+cp .env.example .env   # 大模型 Key 可后填
 docker compose up -d --build
 # 打开 http://localhost:8090
 ```
@@ -45,7 +56,7 @@ docker compose up -d --build
 
 通过这个项目，你将掌握当下最热门的 AI 应用开发技术，包括 OpenRouter 多模型集成、SSE 流式响应、场景化批量测试、AI 评分系统等，大幅提升求职竞争力。
 
-除了 Java 主版本外，项目还提供了 **Go 版本**（Gin + LangChainGo）和 **Python 版本**（FastAPI + LangChain），三套后端共用同一套前端，方便不同技术栈的同学学习。每个版本都有独立的简历写法和面试题解，直接写满你的简历。
+**本仓库仅使用 Java 后端**（Spring Boot + Spring AI）。上游教程另有 Go / Python 实现，此处已移除以保持仓库精简。
 
 ![](frontend/src/assets/image/Typoraimage-20260129160900291.png)
 
