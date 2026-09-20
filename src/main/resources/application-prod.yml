@@ -1,0 +1,55 @@
+# 生产环境：敏感配置一律从环境变量读取（见 .env.example / docker-compose.yml）
+spring:
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+  data:
+    redis:
+      database: ${SPRING_DATA_REDIS_DATABASE:0}
+      host: ${SPRING_DATA_REDIS_HOST}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      timeout: 5000
+      password: ${SPRING_DATA_REDIS_PASSWORD:}
+  rabbitmq:
+    host: ${SPRING_RABBITMQ_HOST}
+    port: ${SPRING_RABBITMQ_PORT:5672}
+    username: ${SPRING_RABBITMQ_USERNAME}
+    password: ${SPRING_RABBITMQ_PASSWORD}
+    virtual-host: /
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    listener:
+      simple:
+        acknowledge-mode: manual
+        prefetch: 1
+  ai:
+    openai:
+      base-url: ${SPRING_AI_OPENAI_BASE_URL:https://openrouter.ai/api}
+      api-key: ${SPRING_AI_OPENAI_API_KEY:${OPENROUTER_API_KEY}}
+      chat:
+        options:
+          model: ${SPRING_AI_DEFAULT_MODEL:qwen/qwen-plus}
+          temperature: 0.7
+          max-tokens: 4096
+  devtools:
+    restart:
+      enabled: false
+
+logging:
+  level:
+    root: info
+    com.yupi.template: info
+    org.springframework.ai: warn
+
+knife4j:
+  enable: ${KNIFE4J_ENABLE:false}
+
+tencent:
+  cos:
+    accessKey: ${TENCENT_COS_ACCESS_KEY:placeholder}
+    secretKey: ${TENCENT_COS_SECRET_KEY:placeholder}
+    region: ${TENCENT_COS_REGION:ap-guangzhou}
+    bucket: ${TENCENT_COS_BUCKET:your-bucket}
+    host: ${TENCENT_COS_HOST:https://your-bucket.cos.ap-guangzhou.myqcloud.com}

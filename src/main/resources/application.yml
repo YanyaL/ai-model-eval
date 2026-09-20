@@ -1,0 +1,100 @@
+spring:
+  application:
+    name: ai-test
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:local}
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 50MB
+  session:
+    store-type: redis
+    timeout: 2592000
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: ${SPRING_DATASOURCE_URL:jdbc:mysql://localhost:3306/ai_eval}
+    username: ${SPRING_DATASOURCE_USERNAME:root}
+    password: ${SPRING_DATASOURCE_PASSWORD:11111111}
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      database: ${SPRING_DATA_REDIS_DATABASE:0}
+      password: ${SPRING_DATA_REDIS_PASSWORD:}
+  rabbitmq:
+    host: ${SPRING_RABBITMQ_HOST:127.0.0.1}
+    port: ${SPRING_RABBITMQ_PORT:5672}
+    username: ${SPRING_RABBITMQ_USERNAME:guest}
+    password: ${SPRING_RABBITMQ_PASSWORD:guest}
+    virtual-host: /
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    listener:
+      simple:
+        acknowledge-mode: manual
+        prefetch: 1
+  ai:
+    openai:
+      base-url: ${SPRING_AI_OPENAI_BASE_URL:https://openrouter.ai/api}
+      api-key: ${SPRING_AI_OPENAI_API_KEY:${OPENROUTER_API_KEY:}}
+      chat:
+        options:
+          model: ${SPRING_AI_DEFAULT_MODEL:qwen/qwen-plus}
+          temperature: 0.7
+          max-tokens: 4096
+  devtools:
+    restart:
+      enabled: true
+server:
+  port: ${SERVER_PORT:8123}
+  servlet:
+    context-path: /api
+    session:
+      cookie:
+        max-age: 2592000
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
+springdoc:
+  group-configs:
+    - group: 'default'
+      paths-to-match: '/**'
+      packages-to-scan: com.yupi.template.controller
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+mybatis-flex:
+  configuration:
+    map-underscore-to-camel-case: false
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+  global-config:
+    print-banner: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, prometheus, info
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: when-authorized
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+
+logging:
+  level:
+    com.yupi.template.mapper: info
+    org.springframework.ai: info
+
+# 腾讯云 COS（图片上传）；未配置时用占位值，上传功能需补齐真实密钥
+tencent:
+  cos:
+    accessKey: ${TENCENT_COS_ACCESS_KEY:placeholder}
+    secretKey: ${TENCENT_COS_SECRET_KEY:placeholder}
+    region: ${TENCENT_COS_REGION:ap-guangzhou}
+    bucket: ${TENCENT_COS_BUCKET:your-bucket}
+    host: ${TENCENT_COS_HOST:https://your-bucket.cos.ap-guangzhou.myqcloud.com}

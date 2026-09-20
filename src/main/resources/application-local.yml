@@ -1,0 +1,16 @@
+# 本地开发环境配置
+spring:
+  # MySQL 数据库配置
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/ai_eval
+    username: root
+    password: 11111111
+  # Redis 配置
+  data:
+    redis:
+      database: 1
+      host: 127.0.0.1
+      port: 6379
+      timeout: 5000
+      password: 111111

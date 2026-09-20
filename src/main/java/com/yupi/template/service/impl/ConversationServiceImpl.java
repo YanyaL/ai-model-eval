@@ -1,0 +1,1993 @@
+package com.yupi.template.service.impl;
+
+import cn.hutool.core.util.IdUtil;
+import cn.hutool.json.JSONUtil;
+import com.mybatisflex.core.paginate.Page;
+import com.mybatisflex.core.query.QueryWrapper;
+import com.yupi.template.constant.ConversationConstant;
+import com.yupi.template.exception.BusinessException;
+import com.yupi.template.exception.ErrorCode;
+import com.yupi.template.exception.ThrowUtils;
+import com.yupi.template.guardrail.PromptGuardrail;
+import com.yupi.template.mapper.ConversationMapper;
+import com.yupi.template.mapper.ConversationMessageMapper;
+import com.yupi.template.mapper.ModelMapper;
+import com.yupi.template.model.dto.conversation.BattleRequest;
+import com.yupi.template.model.dto.conversation.ChatRequest;
+import com.yupi.template.model.dto.conversation.CreateConversationRequest;
+import com.yupi.template.model.dto.conversation.PromptLabRequest;
+import com.yupi.template.model.dto.conversation.SideBySideRequest;
+import com.yupi.template.model.dto.conversation.CodeModeRequest;
+import com.yupi.template.model.dto.conversation.CodeModePromptLabRequest;
+import com.yupi.template.model.entity.Conversation;
+import com.yupi.template.model.entity.ConversationMessage;
+import com.yupi.template.model.enums.ConversationTypeEnum;
+import com.yupi.template.model.enums.MessageRoleEnum;
+import com.yupi.template.model.vo.StreamChunkVO;
+import com.yupi.template.service.ConversationService;
+import com.yupi.template.utils.CodeExtractor;
+import com.yupi.template.model.dto.code.CodeBlock;
+import jakarta.annotation.Resource;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.MessageType;
+import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.metadata.Usage;
+import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.openai.OpenAiChatOptions;
+import org.springframework.ai.content.Media;
+import org.springframework.http.codec.ServerSentEvent;
+import org.springframework.stereotype.Service;
+import org.springframework.util.MimeType;
+import org.springframework.util.MimeTypeUtils;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.math.BigDecimal;
+import java.net.URI;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+/**
+ * 对话服务实现类
+ *
+ * @author <a href="https://codefather.cn">编程导航学习圈</a>
+ */
+@Slf4j
+@Service
+public class ConversationServiceImpl implements ConversationService {
+
+    private static final String ONLINE_SUFFIX = ":online";
+    private static final int MAX_WEB_SOURCES = 5;
+    private static final Pattern URL_PATTERN = Pattern.compile("https?://[^\\s)\\]}>\"']+");
+
+    @Resource
+    private ChatClient chatClient;
+
+    @Resource
+    private org.springframework.ai.chat.model.ChatModel chatModel;
+
+    @Resource
+    private ConversationMapper conversationMapper;
+
+    @Resource
+    private ConversationMessageMapper conversationMessageMapper;
+
+    @Resource
+    private ModelMapper modelMapper;
+
+    @Resource
+    private com.yupi.template.service.ModelService modelService;
+    @Resource
+    private com.yupi.template.service.UserModelUsageService userModelUsageService;
+
+    @Override
+    public String createConversation(CreateConversationRequest request, Long userId) {
+        // 参数校验
+        if (request.getConversationType() == null || request.getConversationType().trim().isEmpty()) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "对话类型不能为空");
+        }
+        ConversationTypeEnum typeEnum = ConversationTypeEnum.getEnumByValue(request.getConversationType());
+        if (typeEnum == null) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "对话类型无效");
+        }
+        if (request.getModels() == null || request.getModels().isEmpty()) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "模型列表不能为空");
+        }
+
+        // 创建对话
+        String conversationId = IdUtil.randomUUID();
+        String title = request.getTitle() != null && !request.getTitle().trim().isEmpty()
+                ? request.getTitle()
+                : "新对话";
+
+        boolean codePreviewEnabled = request.getCodePreviewEnabled() != null && request.getCodePreviewEnabled();
+        
+        Conversation conversation = Conversation.builder()
+                .id(conversationId)
+                .userId(userId)
+                .title(title)
+                .conversationType(typeEnum.getValue())
+                .codePreviewEnabled(codePreviewEnabled)
+                .isAnonymous(false)
+                .models(JSONUtil.toJsonStr(request.getModels()))
+                .totalTokens(0)
+                .totalCost(BigDecimal.ZERO)
+                .createTime(LocalDateTime.now())
+                .updateTime(LocalDateTime.now())
+                .isDelete(0)
+                .build();
+        conversationMapper.insert(conversation);
+
+        return conversationId;
+    }
+
+    @Override
+    public Flux<ServerSentEvent<StreamChunkVO>> chatStream(ChatRequest request, Long userId) {
+        // 1. 参数校验
+        ThrowUtils.throwIf(request == null, ErrorCode.PARAMS_ERROR);
+        ThrowUtils.throwIf(request.getModel() == null || request.getModel().isEmpty(),
+                ErrorCode.PARAMS_ERROR, "模型名称不能为空");
+        ThrowUtils.throwIf(request.getMessage() == null || request.getMessage().isEmpty(),
+                ErrorCode.PARAMS_ERROR, "消息内容不能为空");
+        PromptGuardrail.validate(request.getMessage());
+
+        // 2. 创建或获取对话记录
+        String conversationId = createOrGetConversation(
+                request.getConversationId(),
+                userId,
+                request.getMessage(),
+                ConversationTypeEnum.SIDE_BY_SIDE,
+                List.of(request.getModel())
+        );
+
+        // 3. 保存用户消息并获取消息索引
+        int userMessageIndex = saveUserMessage(conversationId, userId, request.getMessage(), request.getImageUrls());
+        int assistantMessageIndex = userMessageIndex + 1;
+
+        // 4. 调用模型并返回流式响应
+        return createModelStream(
+                conversationId,
+                userId,
+                request.getModel(),
+                request.getMessage(),
+                null,  // variantIndex: null 表示非 Prompt Lab 模式
+                assistantMessageIndex,  // 固定的消息索引
+                request.getImageUrls(),
+                request.getWebSearchEnabled()
+        );
+    }
+
+    @Override
+    public Flux<ServerSentEvent<StreamChunkVO>> sideBySideStream(SideBySideRequest request, Long userId) {
+        // 1. 参数校验
+        validateSideBySideRequest(request);
+        PromptGuardrail.validate(request.getPrompt());
+
+        // 2. 创建或获取对话记录
+        String conversationId = createOrGetConversation(
+                request.getConversationId(),
+                userId,
+                request.getPrompt(),
+                ConversationTypeEnum.SIDE_BY_SIDE,
+                request.getModels()
+        );
+
+        // 3. 保存用户消息（每次对话都保存），并获取其messageIndex
+        int userMessageIndex = saveUserMessage(conversationId, userId, request.getPrompt(), request.getImageUrls());
+        // 所有模型的响应将使用下一个index（同一个index）
+        int assistantMessageIndex = userMessageIndex + 1;
+
+        // 记录图片URL信息用于调试
+        if (request.getImageUrls() != null && !request.getImageUrls().isEmpty()) {
+            log.info("Side-by-Side请求包含 {} 张图片: {}", request.getImageUrls().size(), request.getImageUrls());
+        } else {
+            log.info("Side-by-Side请求不包含图片");
+        }
+
+        // 4. 并行调用多个模型，使用Flux.merge实现真正的流式并发
+        log.info("开始并行调用 {} 个模型: {}", request.getModels().size(), request.getModels());
+
+        List<Flux<ServerSentEvent<StreamChunkVO>>> modelFluxes = new ArrayList<>();
+        for (String modelName : request.getModels()) {
+            log.info("创建模型流: {}", modelName);
+            Flux<ServerSentEvent<StreamChunkVO>> modelFlux = createModelStream(
+                    conversationId,
+                    userId,
+                    modelName,
+                    request.getPrompt(),
+                    null,
+                    assistantMessageIndex,  // 传递固定的messageIndex
+                    request.getImageUrls(),
+                    request.getWebSearchEnabled()
+            );
+            modelFluxes.add(modelFlux);
+        }
+
+        // 使用Flux.merge并指定高并发数，确保所有流都能立即开始且事件立即发送
+        int concurrency = Math.min(request.getModels().size(), 8);
+        log.info("使用Flux.merge，并发数: {}, 流数量: {}", concurrency, modelFluxes.size());
+
+        // Flux.merge会立即订阅所有流并立即发送事件（不等待）
+        @SuppressWarnings("unchecked")
+        Flux<ServerSentEvent<StreamChunkVO>> mergedFlux = Flux.merge(concurrency, modelFluxes.toArray(new Flux[0]));
+        return mergedFlux;
+    }
+
+    @Override
+    public Flux<ServerSentEvent<StreamChunkVO>> promptLabStream(PromptLabRequest request, Long userId) {
+        // 1. 参数校验
+        validatePromptLabRequest(request);
+        for (String v : request.getPromptVariants()) {
+            PromptGuardrail.validate(v);
+        }
+
+        // 2. 创建或获取对话记录
+        String conversationId = createOrGetConversation(
+                request.getConversationId(),
+                userId,
+                request.getPromptVariants().get(0),
+                ConversationTypeEnum.PROMPT_LAB,
+                Collections.singletonList(request.getModel())
+        );
+
+        // 3. 获取本轮对话的messageIndex（所有变体共享同一个messageIndex）
+        int userMessageIndex = getNextMessageIndex(conversationId);
+        int assistantMessageIndex = userMessageIndex + 1;
+
+        // 4. 为每个变体保存用户消息（支持图片）
+        for (int i = 0; i < request.getPromptVariants().size(); i++) {
+            String promptVariant = request.getPromptVariants().get(i);
+            List<String> variantImages = getVariantImagesSafe(request.getVariantImageUrls(), i);
+            saveUserMessage(conversationId, userId, promptVariant, variantImages, userMessageIndex, i);
+        }
+
+        // 5. 并行调用同一模型的不同提示词变体
+        List<Flux<ServerSentEvent<StreamChunkVO>>> variantFluxes = new ArrayList<>();
+        for (int i = 0; i < request.getPromptVariants().size(); i++) {
+            String promptVariant = request.getPromptVariants().get(i);
+            List<String> variantImages = getVariantImagesSafe(request.getVariantImageUrls(), i);
+            Flux<ServerSentEvent<StreamChunkVO>> variantFlux = createModelStream(
+                    conversationId,
+                    userId,
+                    request.getModel(),
+                    promptVariant,
+                    i,
+                    assistantMessageIndex,  // 所有变体的AI响应使用同一个messageIndex
+                    variantImages,
+                    request.getWebSearchEnabled()
+            );
+            variantFluxes.add(variantFlux);
+        }
+
+        // 6. 合并所有变体的流
+        return Flux.merge(variantFluxes);
+    }
+
+    @Override
+    public Flux<ServerSentEvent<StreamChunkVO>> codeModeStream(CodeModeRequest request, Long userId) {
+        // 1. 参数校验
+        validateCodeModeRequest(request);
+        PromptGuardrail.validate(request.getPrompt());
+
+        // 2. 创建或获取对话记录（使用codePreviewEnabled=true，conversationType为side_by_side）
+        String conversationId = createOrGetConversation(
+                request.getConversationId(),
+                userId,
+                request.getPrompt(),
+                ConversationTypeEnum.SIDE_BY_SIDE,
+                request.getModels(),
+                true  // codePreviewEnabled = true
+        );
+
+        // 3. 保存用户消息
+        int userMessageIndex = saveUserMessage(conversationId, userId, request.getPrompt(), request.getImageUrls());
+        int assistantMessageIndex = userMessageIndex + 1;
+
+        // 4. 并行调用多个模型（带系统提示词）
+        List<Flux<ServerSentEvent<StreamChunkVO>>> modelFluxes = new ArrayList<>();
+        for (String modelName : request.getModels()) {
+            Flux<ServerSentEvent<StreamChunkVO>> modelFlux = createModelStreamWithSystemPrompt(
+                    conversationId,
+                    userId,
+                    modelName,
+                    request.getPrompt(),
+                    ConversationConstant.CODE_MODE_SYSTEM_PROMPT,
+                    null,
+                    request.getImageUrls(),
+                    assistantMessageIndex,
+                    request.getWebSearchEnabled()
+            );
+            modelFluxes.add(modelFlux);
+        }
+
+        // 5. 合并所有模型的流
+        int concurrency = Math.min(request.getModels().size(), 8);
+        @SuppressWarnings("unchecked")
+        Flux<ServerSentEvent<StreamChunkVO>> mergedFlux = Flux.merge(concurrency, modelFluxes.toArray(new Flux[0]));
+        return mergedFlux;
+    }
+
+    @Override
+    public Flux<ServerSentEvent<StreamChunkVO>> battleStream(BattleRequest request, Long userId) {
+        // 1. 参数校验
+        ThrowUtils.throwIf(request == null, ErrorCode.PARAMS_ERROR);
+        ThrowUtils.throwIf(request.getPrompt() == null || request.getPrompt().trim().isEmpty(),
+                ErrorCode.PARAMS_ERROR, "提示词不能为空");
+        PromptGuardrail.validate(request.getPrompt());
+        if (request.getImageUrls() != null && !request.getImageUrls().isEmpty()) {
+            log.info("Battle请求包含 {} 张图片: {}", request.getImageUrls().size(), request.getImageUrls());
+        }
+
+
+        boolean hasImages = request.getImageUrls() != null && !request.getImageUrls().isEmpty();
+        // 2. 确定要对比的模型列表和映射关系
+        List<String> models;
+        Map<String, String> modelMapping;
+        String conversationId;
+        boolean codePreviewEnabled;
+        if (request.getConversationId() != null && !request.getConversationId().isEmpty()) {
+            // 已有对话：使用已保存的模型映射，不重新随机选择
+            conversationId = request.getConversationId();
+
+            // 直接使用 selectOneById 查询，确保查询所有字段
+            Conversation existingConversation = conversationMapper.selectOneById(conversationId);
+            ThrowUtils.throwIf(existingConversation == null, ErrorCode.NOT_FOUND_ERROR, "对话不存在");
+            ThrowUtils.throwIf(!existingConversation.getUserId().equals(userId), ErrorCode.NO_AUTH_ERROR, "无权访问该对话");
+            codePreviewEnabled=existingConversation.getCodePreviewEnabled();
+            // 解析已保存的模型映射
+            String modelMappingJson = existingConversation.getModelMapping();
+            log.info("Battle模式：查询到的 modelMapping={}", modelMappingJson);
+
+            if (modelMappingJson == null || modelMappingJson.trim().isEmpty()) {
+                log.error("Battle模式：对话 {} 的 modelMapping 为空，existingConversation={}",
+                        conversationId, JSONUtil.toJsonStr(existingConversation));
+                throw new BusinessException(ErrorCode.SYSTEM_ERROR, "对话的模型映射不存在");
+            }
+
+            @SuppressWarnings("unchecked")
+            Map<String, String> parsedMapping = JSONUtil.toBean(modelMappingJson, Map.class);
+            modelMapping = parsedMapping;
+
+            // 从映射 Mapping 中提取模型列表
+            models = new ArrayList<>(modelMapping.values());
+            log.info("Battle模式：使用已有对话的模型映射，conversationId={}, 模型映射={}", conversationId, modelMapping);
+        } else {
+            // 新对话：随机选择模型并创建映射
+            models = request.getModels();
+        if (models == null || models.isEmpty()) {
+            // 获取所有模型列表
+            List<com.yupi.template.model.vo.ModelVO> allModels = modelService.getAllModels(userId);
+            if (allModels == null || allModels.size() < 2) {
+                throw new BusinessException(ErrorCode.PARAMS_ERROR, "可用模型数量不足，无法进行Battle对比");
+            }
+
+            // 如果用户上传了图片，只从支持多模态的模型中选择
+            if (hasImages) {
+                allModels = allModels.stream()
+                        .filter(model -> model.getSupportsMultimodal() != null && model.getSupportsMultimodal())
+                        .collect(Collectors.toList());
+                if (allModels.size() < 2) {
+                    throw new BusinessException(ErrorCode.PARAMS_ERROR, "支持多模态的模型数量不足，无法进行图片对比");
+                }
+                log.info("Battle模式：用户上传了图片，从{}个多模态模型中选择", allModels.size());
+            }
+            
+            // 筛选出国内模型（isChina=true）
+            List<com.yupi.template.model.vo.ModelVO> chinaModels = allModels.stream()
+                    .filter(model -> model.getIsChina() != null && model.getIsChina())
+                    .collect(Collectors.toList());
+            
+            List<com.yupi.template.model.vo.ModelVO> selectedModels;
+            if (chinaModels.size() >= 2) {
+                // 如果国内模型数量>=2，从国内模型中随机选择2个
+                Collections.shuffle(chinaModels);
+                selectedModels = chinaModels.subList(0, 2);
+                log.info("Battle模式：从{}个国内模型中随机选择2个", chinaModels.size());
+            } else if (chinaModels.size() == 1) {
+                // 如果只有1个国内模型，选择它+1个其他模型
+                Collections.shuffle(allModels);
+                com.yupi.template.model.vo.ModelVO otherModel = allModels.stream()
+                        .filter(model -> !model.getId().equals(chinaModels.get(0).getId()))
+                        .findFirst()
+                        .orElse(null);
+                if (otherModel == null) {
+                    throw new BusinessException(ErrorCode.PARAMS_ERROR, "可用模型数量不足，无法进行Battle对比");
+                }
+                selectedModels = java.util.Arrays.asList(chinaModels.get(0), otherModel);
+                log.info("Battle模式：选择1个国内模型+1个其他模型");
+            } else {
+                // 如果没有国内模型，从所有模型中随机选择2个
+                Collections.shuffle(allModels);
+                selectedModels = allModels.subList(0, 2);
+                log.warn("Battle模式：未找到国内模型，从所有模型中随机选择2个");
+            }
+            
+            models = selectedModels.stream()
+                    .map(com.yupi.template.model.vo.ModelVO::getId)
+                    .collect(Collectors.toList());
+            log.info("Battle模式：随机选择模型: {}", models);
+        } else if (models.size() < 2) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "Battle模式至少需要2个模型");
+        } else if (models.size() > 2) {
+            // 如果用户提供了超过2个模型，只使用前2个
+            models = models.subList(0, 2);
+            log.info("Battle模式：使用前2个模型: {}", models);
+        }
+
+        // 3. 创建匿名标识映射（模型A、模型B）
+        modelMapping = new HashMap<>();
+        modelMapping.put("模型A", models.get(0));
+        modelMapping.put("模型B", models.get(1));
+
+
+            // 创建新对话
+            conversationId = IdUtil.randomUUID();
+              codePreviewEnabled = request.getCodePreviewEnabled() != null && request.getCodePreviewEnabled();
+            Conversation conversation = Conversation.builder()
+                    .id(conversationId)
+                    .userId(userId)
+                    .title(generateTitle(request.getPrompt()))
+                    .conversationType(ConversationTypeEnum.BATTLE.getValue())
+                    .codePreviewEnabled(codePreviewEnabled)
+                    .isAnonymous(true)
+                    .modelMapping(JSONUtil.toJsonStr(modelMapping))
+                    .models(JSONUtil.toJsonStr(models))
+                    .totalTokens(0)
+                    .totalCost(BigDecimal.ZERO)
+                    .createTime(LocalDateTime.now())
+                    .updateTime(LocalDateTime.now())
+                    .isDelete(0)
+                    .build();
+            conversationMapper.insert(conversation);
+            log.info("Battle模式：创建新对话，conversationId={}, 模型映射={}, codePreviewEnabled={}", 
+                    conversationId, modelMapping, codePreviewEnabled);
+        }
+
+        // 5. 保存用户消息
+        int userMessageIndex = saveUserMessage(conversationId, userId, request.getPrompt(), request.getImageUrls());
+        int assistantMessageIndex = userMessageIndex + 1;
+        log.info("Battle模式：conversationId={}, codePreviewEnabled={}", conversationId, codePreviewEnabled);
+
+        // 6. 并行调用两个模型，使用匿名标识
+        List<Flux<ServerSentEvent<StreamChunkVO>>> modelFluxes = new ArrayList<>();
+        for (int i = 0; i < models.size(); i++) {
+            String realModelName = models.get(i);
+            String anonymousName = i == 0 ? "模型A" : "模型B";
+
+            log.info("Battle模式：创建模型流，匿名标识={}, 真实模型={}, codePreviewEnabled={}",
+                    anonymousName, realModelName, codePreviewEnabled);
+
+            // 根据 codePreviewEnabled 决定使用哪个方法
+            Flux<ServerSentEvent<StreamChunkVO>> modelFlux;
+            if (codePreviewEnabled) {
+                // 代码模式：使用系统提示词
+                modelFlux = createModelStreamWithSystemPrompt(
+                        conversationId,
+                        userId,
+                        realModelName,
+                        request.getPrompt(),
+                        ConversationConstant.CODE_MODE_SYSTEM_PROMPT,
+                        assistantMessageIndex
+                );
+            } else {
+                // 普通模式：不使用系统提示词
+                modelFlux = createModelStream(
+                        conversationId,
+                        userId,
+                        realModelName,
+                        request.getPrompt(),
+                        null,
+                        assistantMessageIndex,
+                        request.getImageUrls(),
+                        request.getWebSearchEnabled()
+                );
+            }
+
+            modelFlux = modelFlux.map(event -> {
+                // 将真实模型名替换为匿名标识
+                if (event.data() != null) {
+                    StreamChunkVO chunk = event.data();
+                    if (realModelName.equals(chunk.getModelName())) {
+                        StreamChunkVO anonymousChunk = StreamChunkVO.builder()
+                                .conversationId(chunk.getConversationId())
+                                .modelName(anonymousName)
+                                .variantIndex(chunk.getVariantIndex())
+                                .content(chunk.getContent())
+                                .fullContent(chunk.getFullContent())
+                                .inputTokens(chunk.getInputTokens())
+                                .outputTokens(chunk.getOutputTokens())
+                                .totalTokens(chunk.getTotalTokens())
+                                .elapsedMs(chunk.getElapsedMs())
+                                .responseTimeMs(chunk.getResponseTimeMs())
+                                .cost(chunk.getCost())
+                                .done(chunk.getDone())
+                                .error(chunk.getError())
+                                .hasError(chunk.getHasError())
+                                .reasoning(chunk.getReasoning())
+                                .hasReasoning(chunk.getHasReasoning())
+                                .thinkingTime(chunk.getThinkingTime())
+                                .messageIndex(chunk.getMessageIndex())
+                                .codeBlocks(chunk.getCodeBlocks())
+                                .hasCodeBlocks(chunk.getHasCodeBlocks())
+                                .toolsUsed(chunk.getToolsUsed())
+                                .build();
+                        return ServerSentEvent.<StreamChunkVO>builder()
+                                .data(anonymousChunk)
+                                .build();
+                    }
+                }
+                return event;
+            });
+            modelFluxes.add(modelFlux);
+        }
+
+        // 7. 合并所有模型的流
+        @SuppressWarnings("unchecked")
+        Flux<ServerSentEvent<StreamChunkVO>> mergedFlux = Flux.merge(2, modelFluxes.toArray(new Flux[0]));
+        return mergedFlux;
+    }
+
+    @Override
+    public Flux<ServerSentEvent<StreamChunkVO>> codeModePromptLabStream(CodeModePromptLabRequest request, Long userId) {
+        // 1. 参数校验
+        validateCodeModePromptLabRequest(request);
+        for (String v : request.getPromptVariants()) {
+            PromptGuardrail.validate(v);
+        }
+
+        // 2. 创建或获取对话记录（使用codePreviewEnabled=true，conversationType为prompt_lab）
+        String conversationId = createOrGetConversation(
+                request.getConversationId(),
+                userId,
+                request.getPromptVariants().get(0),
+                ConversationTypeEnum.PROMPT_LAB,
+                Collections.singletonList(request.getModel()),
+                true  // codePreviewEnabled = true
+        );
+
+        // 3. 获取本轮对话的messageIndex（所有变体共享同一个messageIndex）
+        int userMessageIndex = getNextMessageIndex(conversationId);
+        int assistantMessageIndex = userMessageIndex + 1;
+
+        // 4. 为每个变体保存用户消息
+        for (int i = 0; i < request.getPromptVariants().size(); i++) {
+            String promptVariant = request.getPromptVariants().get(i);
+            List<String> variantImages = getVariantImagesSafe(request.getVariantImageUrls(), i);
+            saveUserMessage(conversationId, userId, promptVariant, variantImages, userMessageIndex, i);
+            log.info("保存变体{}的用户消息: messageIndex={}, content={}", i, userMessageIndex, promptVariant);
+        }
+
+        // 5. 并行调用同一模型的不同提示词变体（使用代码模式的系统提示词）
+        List<Flux<ServerSentEvent<StreamChunkVO>>> variantFluxes = new ArrayList<>();
+        for (int i = 0; i < request.getPromptVariants().size(); i++) {
+            String promptVariant = request.getPromptVariants().get(i);
+            Flux<ServerSentEvent<StreamChunkVO>> variantFlux = createModelStreamWithSystemPrompt(
+                    conversationId,
+                    userId,
+                    request.getModel(),
+                    promptVariant,
+                    ConversationConstant.CODE_MODE_SYSTEM_PROMPT,
+                    i,  // variantIndex
+                    getVariantImagesSafe(request.getVariantImageUrls(), i),
+                    assistantMessageIndex,  // 所有变体的AI响应使用同一个messageIndex
+                    request.getWebSearchEnabled()
+            );
+            variantFluxes.add(variantFlux);
+        }
+
+        // 5. 合并所有变体的流
+        int concurrency = Math.min(request.getPromptVariants().size(), 8);
+        @SuppressWarnings("unchecked")
+        Flux<ServerSentEvent<StreamChunkVO>> mergedFlux = Flux.merge(concurrency, variantFluxes.toArray(new Flux[0]));
+        return mergedFlux;
+    }
+
+    @Override
+    public Conversation getConversation(String conversationId, Long userId) {
+        QueryWrapper wrapper = QueryWrapper.create()
+                .from(Conversation.class)
+                .where("id = ? and userId = ? and isDelete = 0", conversationId, userId);
+        return conversationMapper.selectOneByQuery(wrapper);
+    }
+
+    @Override
+    public Page<Conversation> listConversations(Long userId, int pageNum, int pageSize, Boolean codePreviewEnabled) {
+        QueryWrapper wrapper = QueryWrapper.create()
+                .from(Conversation.class)
+                .where("userId = ? and isDelete = 0", userId);
+        
+        if (codePreviewEnabled != null) {
+            wrapper.and("codePreviewEnabled = ?", codePreviewEnabled);
+        }
+        
+        wrapper.orderBy("createTime", false);
+        return conversationMapper.paginate(pageNum, pageSize, wrapper);
+    }
+
+    @Override
+    public List<ConversationMessage> getConversationMessages(String conversationId, Long userId) {
+        // 先验证对话是否属于当前用户
+        Conversation conversation = getConversation(conversationId, userId);
+        ThrowUtils.throwIf(conversation == null, ErrorCode.NOT_FOUND_ERROR, "对话不存在");
+
+        // 查询消息列表
+        // 注意：MyBatis-Flex 在处理 MySQL JSON 类型字段时可能返回 null
+        // 使用自定义的 Mapper 方法，通过 JSON_UNQUOTE 函数正确处理 JSON 字段
+        List<ConversationMessage> messages = conversationMessageMapper.selectByConversationIdWithImages(conversationId);
+        
+        // 添加日志，检查 images 字段
+        for (ConversationMessage msg : messages) {
+            if (msg.getRole() != null && MessageRoleEnum.ASSISTANT.getValue().equals(msg.getRole())) {
+                log.info("📨 查询消息: messageId={}, role={}, modelName={}, images={}", 
+                        msg.getId(), msg.getRole(), msg.getModelName(), msg.getImages());
+            }
+        }
+        
+        return messages;
+    }
+
+    @Override
+    public boolean deleteConversation(String conversationId, Long userId) {
+        // 验证对话是否属于当前用户
+        Conversation conversation = getConversation(conversationId, userId);
+        ThrowUtils.throwIf(conversation == null, ErrorCode.NOT_FOUND_ERROR, "对话不存在");
+
+        // 逻辑删除
+        conversation.setIsDelete(1);
+        conversation.setUpdateTime(LocalDateTime.now());
+        return conversationMapper.update(conversation) > 0;
+    }
+
+    @Override
+    public com.yupi.template.model.vo.BattleModelMappingVO getBattleModelMapping(String conversationId, Long userId) {
+        // 验证对话是否属于当前用户
+        Conversation conversation = getConversation(conversationId, userId);
+        ThrowUtils.throwIf(conversation == null, ErrorCode.NOT_FOUND_ERROR, "对话不存在");
+        
+        // 检查是否为Battle模式（isAnonymous=true 或 conversationType=battle）
+        Boolean isAnonymous = conversation.getIsAnonymous();
+        String conversationType = conversation.getConversationType();
+        boolean isBattleMode = (isAnonymous != null && isAnonymous) 
+                || ConversationTypeEnum.BATTLE.getValue().equals(conversationType);
+        ThrowUtils.throwIf(!isBattleMode, ErrorCode.PARAMS_ERROR, "该对话不是Battle模式");
+
+        // 解析模型映射关系
+        String modelMappingJson = conversation.getModelMapping();
+        Map<String, String> mapping = null;
+        
+        if (modelMappingJson != null && !modelMappingJson.trim().isEmpty()) {
+            // 如果存在 modelMapping，直接解析
+            @SuppressWarnings("unchecked")
+            Map<String, String> parsedMapping = JSONUtil.toBean(modelMappingJson, Map.class);
+            mapping = parsedMapping;
+        } else {
+            // 如果 modelMapping 不存在，尝试从 models 字段或消息记录中恢复
+            log.warn("Battle模式对话的modelMapping为空，尝试恢复映射关系，conversationId={}", conversationId);
+            
+            // 方法1：从 models 字段恢复（假设是2个模型，按顺序映射为模型A和模型B）
+            String modelsJson = conversation.getModels();
+            if (modelsJson != null && !modelsJson.trim().isEmpty()) {
+                try {
+                    @SuppressWarnings("unchecked")
+                    List<String> models = JSONUtil.toBean(modelsJson, List.class);
+                    if (models != null && models.size() >= 2) {
+                        mapping = new HashMap<>();
+                        mapping.put("模型A", models.get(0));
+                        mapping.put("模型B", models.get(1));
+                        log.info("从models字段恢复映射关系: {}", mapping);
+                    }
+                } catch (Exception e) {
+                    log.warn("从models字段恢复映射关系失败", e);
+                }
+            }
+            
+            // 方法2：如果方法1失败，从消息记录中获取模型信息
+            if (mapping == null || mapping.isEmpty()) {
+                try {
+                    List<ConversationMessage> messages = getConversationMessages(conversationId, userId);
+                    List<String> modelNames = messages.stream()
+                            .filter(msg -> MessageRoleEnum.ASSISTANT.getValue().equals(msg.getRole()))
+                            .map(ConversationMessage::getModelName)
+                            .filter(modelName -> modelName != null && !modelName.trim().isEmpty())
+                            .distinct()
+                            .collect(Collectors.toList());
+                    
+                    if (modelNames.size() >= 2) {
+                        mapping = new HashMap<>();
+                        mapping.put("模型A", modelNames.get(0));
+                        mapping.put("模型B", modelNames.get(1));
+                        log.info("从消息记录恢复映射关系: {}", mapping);
+                        
+                        // 保存恢复的映射关系到数据库
+                        conversation.setModelMapping(JSONUtil.toJsonStr(mapping));
+                        conversation.setUpdateTime(LocalDateTime.now());
+                        conversationMapper.update(conversation);
+                    }
+                } catch (Exception e) {
+                    log.warn("从消息记录恢复映射关系失败", e);
+                }
+            }
+            
+            // 如果仍然无法恢复，抛出异常
+            if (mapping == null || mapping.isEmpty()) {
+                throw new BusinessException(ErrorCode.SYSTEM_ERROR, "模型映射关系不存在，且无法从对话数据中恢复");
+            }
+        }
+        
+        return com.yupi.template.model.vo.BattleModelMappingVO.builder()
+                .mapping(mapping)
+                .build();
+    }
+
+    /**
+     * 校验Side-by-Side请求
+     */
+    private void validateSideBySideRequest(SideBySideRequest request) {
+        if (request.getModels() == null || request.getModels().isEmpty()) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "模型列表不能为空");
+        }
+        if (request.getModels().size() < ConversationConstant.MIN_MODELS_COUNT ||
+                request.getModels().size() > ConversationConstant.MAX_MODELS_COUNT) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR,
+                    "模型数量必须在" + ConversationConstant.MIN_MODELS_COUNT + "-" +
+                            ConversationConstant.MAX_MODELS_COUNT + "个之间");
+        }
+        if (request.getPrompt() == null || request.getPrompt().trim().isEmpty()) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "提示词不能为空");
+        }
+    }
+
+    /**
+     * 校验Prompt Lab请求
+     */
+    private void validatePromptLabRequest(PromptLabRequest request) {
+        if (request.getModel() == null || request.getModel().trim().isEmpty()) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "模型不能为空");
+        }
+        if (request.getPromptVariants() == null || request.getPromptVariants().isEmpty()) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "提示词变体列表不能为空");
+        }
+        if (request.getPromptVariants().size() < ConversationConstant.MIN_PROMPT_VARIANTS_COUNT ||
+                request.getPromptVariants().size() > ConversationConstant.MAX_PROMPT_VARIANTS_COUNT) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR,
+                    "提示词变体数量必须在" + ConversationConstant.MIN_PROMPT_VARIANTS_COUNT + "-" +
+                            ConversationConstant.MAX_PROMPT_VARIANTS_COUNT + "个之间");
+        }
+    }
+
+    /**
+     * 校验Code Mode Prompt Lab请求
+     */
+    private void validateCodeModePromptLabRequest(CodeModePromptLabRequest request) {
+        if (request.getModel() == null || request.getModel().trim().isEmpty()) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "模型不能为空");
+        }
+        if (request.getPromptVariants() == null || request.getPromptVariants().isEmpty()) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "提示词变体列表不能为空");
+        }
+        if (request.getPromptVariants().size() < ConversationConstant.MIN_PROMPT_VARIANTS_COUNT ||
+                request.getPromptVariants().size() > ConversationConstant.MAX_PROMPT_VARIANTS_COUNT) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR,
+                    "提示词变体数量必须在" + ConversationConstant.MIN_PROMPT_VARIANTS_COUNT + "-" +
+                            ConversationConstant.MAX_PROMPT_VARIANTS_COUNT + "个之间");
+        }
+    }
+
+
+    /**
+     * 校验Code Mode请求
+     */
+    private void validateCodeModeRequest(CodeModeRequest request) {
+        if (request.getModels() == null || request.getModels().isEmpty()) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "模型列表不能为空");
+        }
+        if (request.getModels().size() < ConversationConstant.MIN_MODELS_COUNT ||
+                request.getModels().size() > ConversationConstant.MAX_MODELS_COUNT) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR,
+                    "模型数量必须在" + ConversationConstant.MIN_MODELS_COUNT + "-" +
+                            ConversationConstant.MAX_MODELS_COUNT + "个之间");
+        }
+        if (request.getPrompt() == null || request.getPrompt().trim().isEmpty()) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "需求描述不能为空");
+        }
+    }
+
+    /**
+     * 创建带系统提示词的模型流（用于代码模式）
+     */
+    private Flux<ServerSentEvent<StreamChunkVO>> createModelStreamWithSystemPrompt(
+            String conversationId,
+            Long userId,
+            String modelName,
+            String userPrompt,
+            String systemPrompt,
+            Integer fixedMessageIndex
+    ) {
+        return createModelStreamWithSystemPrompt(conversationId, userId, modelName, userPrompt, systemPrompt, null, null, fixedMessageIndex, false);
+    }
+
+    private Flux<ServerSentEvent<StreamChunkVO>> createModelStreamWithSystemPrompt(
+            String conversationId,
+            Long userId,
+            String modelName,
+            String userPrompt,
+            String systemPrompt,
+            List<String> imageUrls,
+            Integer fixedMessageIndex
+    ) {
+        return createModelStreamWithSystemPrompt(conversationId, userId, modelName, userPrompt, systemPrompt, null, imageUrls, fixedMessageIndex, false);
+    }
+
+    /**
+     * 创建带系统提示词的模型流（用于代码模式，支持variantIndex）
+     */
+    private Flux<ServerSentEvent<StreamChunkVO>> createModelStreamWithSystemPrompt(
+            String conversationId,
+            Long userId,
+            String modelName,
+            String userPrompt,
+            String systemPrompt,
+            Integer variantIndex,
+            List<String> imageUrls,
+            Integer fixedMessageIndex,
+            Boolean webSearchEnabled
+    ) {
+        AtomicLong startTime = new AtomicLong(System.currentTimeMillis());
+        AtomicInteger inputTokens = new AtomicInteger(0);
+        AtomicInteger outputTokens = new AtomicInteger(0);
+        AtomicReference<Double> totalCost = new AtomicReference<>(0.0);
+        AtomicReference<String> fullContent = new AtomicReference<>("");
+        AtomicReference<String> reasoning = new AtomicReference<>("");
+
+        List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
+        
+        // 添加系统提示词（在最前面）
+        if (systemPrompt != null && !systemPrompt.trim().isEmpty()) {
+            messages.add(new SystemMessage(systemPrompt));
+        }
+        
+        List<ConversationMessage> historyMessages = getHistoryMessagesForContext(conversationId, fixedMessageIndex, variantIndex);
+        
+        // 转换历史消息为Spring AI的Message格式
+        boolean hasCurrentUserMessage = false;
+        for (ConversationMessage msg : historyMessages) {
+            if (MessageType.USER.getValue().equals(msg.getRole())) {
+                String content = msg.getContent();
+                // 如果是Prompt Lab模式（variantIndex不为null），只添加当前变体的历史消息
+                if (variantIndex != null) {
+                    if (msg.getVariantIndex() != null && !msg.getVariantIndex().equals(variantIndex)) {
+                        continue;
+                    } else if (msg.getVariantIndex() == null) {
+                        String variantPrefix = "变体" + variantIndex + ":";
+                        if (!content.startsWith(variantPrefix)) {
+                            continue;
+                        }
+                        content = content.substring(variantPrefix.length()).trim();
+                    }
+                    messages.add(buildUserMessage(content, msg.getImages()));
+                    if (content.equals(userPrompt)) {
+                        hasCurrentUserMessage = true;
+                    }
+                } else {
+                    messages.add(buildUserMessage(content, msg.getImages()));
+                    if (content.equals(userPrompt)) {
+                        hasCurrentUserMessage = true;
+                    }
+                }
+            } else if (MessageType.ASSISTANT.getValue().equals(msg.getRole())) {
+                if (modelName.equals(msg.getModelName())) {
+                    if (variantIndex != null) {
+                        if (msg.getVariantIndex() != null && !msg.getVariantIndex().equals(variantIndex)) {
+                            continue;
+                        }
+                    }
+                    String content = msg.getContent();
+                    if (variantIndex != null && content.startsWith("变体")) {
+                        int colonIndex = content.indexOf(":");
+                        if (colonIndex > 0 && colonIndex < content.length() - 1) {
+                            content = content.substring(colonIndex + 1).trim();
+                        }
+                    }
+                    messages.add(new AssistantMessage(content));
+                }
+            }
+        }
+        
+        // 添加当前的用户prompt
+        if (userPrompt != null && !userPrompt.trim().isEmpty()) {
+            if (!hasCurrentUserMessage || messages.size() == 1) {  // 只有系统提示词时也要添加
+                messages.add(buildUserMessage(userPrompt, imageUrls));
+            }
+        }
+        
+        log.info("🚀 代码模式流式调用: model={}, 上下文消息数: {}, 系统提示词长度: {}", 
+                modelName, messages.size(), systemPrompt.length());
+        
+        String effectiveModelName = applyOnlineSuffixIfNeeded(modelName, webSearchEnabled);
+        OpenAiChatOptions.Builder optionsBuilder = OpenAiChatOptions.builder()
+                .model(effectiveModelName)
+                .temperature(ConversationConstant.DEFAULT_TEMPERATURE);
+        
+        Prompt chatPrompt = new Prompt(messages, optionsBuilder.build());
+
+        AtomicReference<Map<String, Object>> lastOutputMetadata = new AtomicReference<>();
+        return chatModel.stream(chatPrompt)
+                .doOnNext(chatResponse -> {
+                    if (chatResponse.getResult() == null || chatResponse.getResult().getOutput() == null) {
+                        return;
+                    }
+                    String content = chatResponse.getResult().getOutput().getText();
+                    log.info("收到流式块: '{}' ({} 字符)", content, content != null ? content.length() : 0);
+                })
+                .map(chatResponse -> {
+                    String content = (chatResponse.getResult() != null && chatResponse.getResult().getOutput() != null)
+                            ? chatResponse.getResult().getOutput().getText()
+                            : null;
+                    // 安全处理 null 值，避免拼接出 "null" 字符串
+                    if (content != null && !content.isEmpty()) {
+                        fullContent.updateAndGet(prev -> prev + content);
+                    }
+                    
+                    if (chatResponse.getResult() != null && chatResponse.getResult().getOutput() != null) {
+                        Map<String, Object> outputMetadata = chatResponse.getResult().getOutput().getMetadata();
+                        if (outputMetadata != null) {
+                            lastOutputMetadata.set(outputMetadata);
+                        }
+                        if (outputMetadata != null && outputMetadata.containsKey("reasoningContent")) {
+                            Object reasoningObj = outputMetadata.get("reasoningContent");
+                            if (reasoningObj != null) {
+                                reasoning.updateAndGet(prev -> prev + reasoningObj.toString());
+                            }
+                        }
+                    }
+
+                    if (chatResponse.getMetadata() != null && chatResponse.getMetadata().getUsage() != null) {
+                        Usage usage = chatResponse.getMetadata().getUsage();
+                        if (usage.getPromptTokens() != null) {
+                            inputTokens.set(usage.getPromptTokens());
+                        }
+                        if (usage.getCompletionTokens() != null) {
+                            outputTokens.set(usage.getCompletionTokens());
+                        }
+                    }
+
+                    StreamChunkVO chunkVO = buildStreamChunk(
+                            conversationId,
+                            modelName,
+                            variantIndex,
+                            content,
+                            fullContent.get(),
+                            inputTokens.get(),
+                            outputTokens.get(),
+                            System.currentTimeMillis() - startTime.get(),
+                            null,
+                            null,
+                            false,
+                            reasoning.get(),
+                            fixedMessageIndex
+                    );
+
+                    return ServerSentEvent.<StreamChunkVO>builder()
+                            .data(chunkVO)
+                            .build();
+                })
+                .concatWith(Mono.defer(() -> {
+                    long responseTimeMs = System.currentTimeMillis() - startTime.get();
+                    
+                    Double cost = totalCost.get();
+                    if (cost == null || cost == 0.0) {
+                        cost = calculateCostByModel(modelName, inputTokens.get(), outputTokens.get());
+                    }
+                    
+                    // 提取代码块并序列化为JSON
+                    String codeBlocksJson = null;
+                    if (fullContent.get() != null && !fullContent.get().isEmpty()) {
+                        List<CodeBlock> codeBlocks = CodeExtractor.extractCodeBlocks(fullContent.get());
+                        if (codeBlocks != null && !codeBlocks.isEmpty()) {
+                            codeBlocksJson = JSONUtil.toJsonStr(codeBlocks);
+                            log.info("💾 保存代码块: 模型={}, 代码块数={}", modelName, codeBlocks.size());
+                        }
+                    }
+                    
+                    String toolsUsedJson = buildWebSearchToolsUsedJson(webSearchEnabled, userPrompt, fullContent.get(), lastOutputMetadata.get());
+                    saveAssistantMessage(
+                            conversationId,
+                            userId,
+                            modelName,
+                            userPrompt,
+                            fullContent.get(),
+                            variantIndex,
+                            (int) responseTimeMs,
+                            inputTokens.get(),
+                            outputTokens.get(),
+                            fixedMessageIndex,
+                            reasoning.get(),
+                            codeBlocksJson,
+                            toolsUsedJson
+                    );
+
+                    int totalTokensValue = inputTokens.get() + outputTokens.get();
+                    StreamChunkVO doneVO = buildStreamChunk(
+                            conversationId,
+                            modelName,
+                            variantIndex,
+                            null,
+                            fullContent.get(),
+                            inputTokens.get(),
+                            outputTokens.get(),
+                            null,
+                            (int) responseTimeMs,
+                            cost,
+                            true,
+                            reasoning.get(),
+                            fixedMessageIndex
+                    );
+                    doneVO.setTotalTokens(totalTokensValue);
+                    doneVO.setToolsUsed(toolsUsedJson);
+
+                    return Mono.just(ServerSentEvent.<StreamChunkVO>builder()
+                            .data(doneVO)
+                            .build());
+                }))
+                .onErrorResume(error -> {
+                    log.error("模型{}调用失败", modelName, error);
+                    StreamChunkVO errorVO = buildErrorChunk(
+                            conversationId,
+                            modelName,
+                            variantIndex,
+                            extractErrorMessage(error),
+                            fixedMessageIndex
+                    );
+                    return Mono.just(ServerSentEvent.<StreamChunkVO>builder()
+                            .data(errorVO)
+                            .build());
+                });
+    }
+
+    /**
+     * 创建或获取对话记录
+     */
+    private String createOrGetConversation(
+            String existingConversationId,
+            Long userId,
+            String prompt,
+            ConversationTypeEnum conversationType,
+            List<String> models
+    ) {
+        return createOrGetConversation(existingConversationId, userId, prompt, conversationType, models, false);
+    }
+
+    /**
+     * 创建或获取对话记录（支持codePreviewEnabled参数）
+     */
+    private String createOrGetConversation(
+            String existingConversationId,
+            Long userId,
+            String prompt,
+            ConversationTypeEnum conversationType,
+            List<String> models,
+            boolean codePreviewEnabled
+    ) {
+        if (existingConversationId != null && !existingConversationId.isEmpty()) {
+            return existingConversationId;
+        }
+
+        String conversationId = IdUtil.randomUUID();
+        
+        Conversation conversation = Conversation.builder()
+                .id(conversationId)
+                .userId(userId)
+                .title(generateTitle(prompt))
+                .conversationType(conversationType.getValue())
+                .codePreviewEnabled(codePreviewEnabled)
+                .isAnonymous(false)
+                .models(JSONUtil.toJsonStr(models))
+                .totalTokens(0)
+                .totalCost(BigDecimal.ZERO)
+                .createTime(LocalDateTime.now())
+                .updateTime(LocalDateTime.now())
+                .isDelete(0)
+                .build();
+        conversationMapper.insert(conversation);
+
+        return conversationId;
+    }
+
+
+    /**
+     * 为单个模型创建流式响应
+     */
+    private Flux<ServerSentEvent<StreamChunkVO>> createModelStream(
+            String conversationId,
+            Long userId,
+            String modelName,
+            String prompt,
+            Integer variantIndex,
+            Integer fixedMessageIndex  // 固定的messageIndex，用于side-by-side模式
+    ) {
+        return createModelStream(conversationId, userId, modelName, prompt, variantIndex, fixedMessageIndex, null, false);
+    }
+
+    /**
+     * 为单个模型创建流式响应（支持图片URL列表）
+     */
+    private Flux<ServerSentEvent<StreamChunkVO>> createModelStream(
+            String conversationId,
+            Long userId,
+            String modelName,
+            String prompt,
+            Integer variantIndex,
+            Integer fixedMessageIndex,
+            List<String> imageUrls,
+            Boolean webSearchEnabled
+    ) {
+        // 累加器：用于统计Token、成本和计时
+        AtomicLong startTime = new AtomicLong(System.currentTimeMillis());
+        AtomicInteger inputTokens = new AtomicInteger(0);
+        AtomicInteger outputTokens = new AtomicInteger(0);
+        AtomicReference<Double> totalCost = new AtomicReference<>(0.0);
+        AtomicReference<String> fullContent = new AtomicReference<>("");
+        AtomicReference<String> reasoning = new AtomicReference<>("");
+
+        // 获取历史消息构建上下文
+        List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
+        
+        // 加载历史消息（排除当前正在创建的消息，如果是Prompt Lab模式，只加载当前变体的消息）
+        List<ConversationMessage> historyMessages = getHistoryMessagesForContext(conversationId, fixedMessageIndex, variantIndex);
+        
+        // 转换历史消息为Spring AI的Message格式
+        boolean hasCurrentUserMessage = false;
+        for (ConversationMessage msg : historyMessages) {
+            if (MessageType.USER.getValue().equals(msg.getRole())) {
+                String content = msg.getContent();
+                // 如果是Prompt Lab模式（variantIndex不为null），只添加当前变体的历史消息
+                // 由于getHistoryMessagesForContext已经过滤了variantIndex，这里直接添加即可
+                if (variantIndex != null) {
+                    // 检查variantIndex是否匹配（兼容旧数据：如果variantIndex为null，说明是旧数据，需要通过内容判断）
+                    if (msg.getVariantIndex() != null && !msg.getVariantIndex().equals(variantIndex)) {
+                        // variantIndex不匹配，跳过
+                        log.debug("⏭️ 跳过非当前变体{}的用户消息: variantIndex={}", variantIndex, msg.getVariantIndex());
+                        continue;
+                    } else if (msg.getVariantIndex() == null) {
+                        // 旧数据：通过内容前缀判断
+                        String variantPrefix = "变体" + variantIndex + ":";
+                        if (!content.startsWith(variantPrefix)) {
+                            log.debug("⏭️ 跳过非当前变体{}的用户消息（旧数据）: {}", variantIndex, content);
+                            continue;
+                        }
+                        // 去除"变体X: "前缀
+                        content = content.substring(variantPrefix.length()).trim();
+                    }
+                    // variantIndex匹配，直接使用content（新数据不再有前缀）
+                    messages.add(buildUserMessage(content, msg.getImages()));
+                    log.info("📝 添加当前变体{}的历史用户消息: {}", variantIndex, content);
+                    // 检查是否是当前prompt
+                    if (content.equals(prompt)) {
+                        hasCurrentUserMessage = true;
+                    }
+                } else {
+                    // 非Prompt Lab模式，直接添加所有用户消息
+                    messages.add(buildUserMessage(content, msg.getImages()));
+                    // 检查是否是当前prompt
+                    if (content.equals(prompt)) {
+                        hasCurrentUserMessage = true;
+                    }
+                }
+            } else if (MessageType.ASSISTANT.getValue().equals(msg.getRole())) {
+                // 只添加当前模型的历史回复（避免混淆）
+                if (modelName.equals(msg.getModelName())) {
+                    // 如果是Prompt Lab模式，需要检查这个AI消息是否属于当前变体
+                    if (variantIndex != null) {
+                        // 优先使用variantIndex字段（如果存在）
+                        if (msg.getVariantIndex() != null) {
+                            if (!msg.getVariantIndex().equals(variantIndex)) {
+                                // 不是当前变体的AI消息，跳过（虽然getHistoryMessagesForContext已经过滤，但为了安全还是检查）
+                                log.debug("⏭️ 跳过非当前变体{}的AI消息: messageIndex={}, variantIndex={}", 
+                                        variantIndex, msg.getMessageIndex(), msg.getVariantIndex());
+                                continue;
+                            }
+                            log.debug("✅ messageIndex {} 的AI消息属于当前变体{} (通过variantIndex字段)", msg.getMessageIndex(), variantIndex);
+                        } else {
+                            // 旧数据：如果没有variantIndex字段，通过对应的用户消息来判断
+                            int msgIndex = msg.getMessageIndex();
+                            int userMessageIndex = msgIndex - 1;
+                            
+                            // 查找对应的用户消息
+                            ConversationMessage correspondingUserMsg = null;
+                            for (ConversationMessage userMsg : historyMessages) {
+                                if (MessageType.USER.getValue().equals(userMsg.getRole()) 
+                                        && userMsg.getMessageIndex() == userMessageIndex) {
+                                    correspondingUserMsg = userMsg;
+                                    break;
+                                }
+                            }
+                            
+                            if (correspondingUserMsg == null) {
+                                log.warn("⚠️ 无法找到对应的用户消息: messageIndex={}, userMessageIndex={}, 跳过", 
+                                        msgIndex, userMessageIndex);
+                                continue;
+                            }
+                            
+                            // 检查用户消息的variantIndex或内容
+                            if (correspondingUserMsg.getVariantIndex() != null) {
+                                // 新数据：通过variantIndex判断
+                                if (!correspondingUserMsg.getVariantIndex().equals(variantIndex)) {
+                                    log.info("⏭️ 跳过非当前变体{}的AI消息: messageIndex={}, 对应的用户variantIndex={}", 
+                                            variantIndex, msgIndex, correspondingUserMsg.getVariantIndex());
+                                    continue;
+                                }
+                            } else {
+                                // 旧数据：通过内容前缀判断
+                                String userContent = correspondingUserMsg.getContent();
+                                String expectedPrefix = "变体" + variantIndex + ":";
+                                if (!userContent.startsWith(expectedPrefix)) {
+                                    log.info("⏭️ 跳过非当前变体{}的AI消息: messageIndex={}, 对应的用户消息内容={}", 
+                                            variantIndex, msgIndex, userContent.substring(0, Math.min(50, userContent.length())));
+                                    continue;
+                                }
+                            }
+                            
+                            log.info("✅ messageIndex {} 的AI消息属于当前变体{} (通过用户消息匹配)", msgIndex, variantIndex);
+                        }
+                    }
+                    
+                    String content = msg.getContent();
+                    // 如果是Prompt Lab模式，检查是否有变体前缀需要去除（旧数据兼容）
+                    if (variantIndex != null && content.startsWith("变体")) {
+                        // 去除"变体X: "前缀（如果存在）
+                        int colonIndex = content.indexOf(":");
+                        if (colonIndex > 0 && colonIndex < content.length() - 1) {
+                            content = content.substring(colonIndex + 1).trim();
+                        }
+                    }
+                    messages.add(new AssistantMessage(content));
+                    log.info("📝 添加当前模型{}的历史AI回复: {}", modelName, content.substring(0, Math.min(50, content.length())));
+                }
+            }
+        }
+
+        // 添加当前的用户prompt
+        // 对于Prompt Lab模式：用户消息是在saveAssistantMessage中保存的，此时可能还没有保存到数据库
+        // 对于Side-by-Side模式：用户消息是在调用createModelStream之前保存的，已经包含在历史消息中
+        // 但是：如果传入了imageUrls参数，说明这是当前请求的图片，应该优先使用传入的imageUrls
+        // 因为历史消息中的图片可能还没有正确保存，或者需要覆盖
+        if (prompt != null && !prompt.trim().isEmpty()) {
+            if (!hasCurrentUserMessage || messages.isEmpty()) {
+                // 历史消息中没有当前prompt，直接添加
+                messages.add(buildUserMessage(prompt, imageUrls));
+                log.info("📝 添加当前用户prompt（历史消息中不存在）: prompt={}, imageUrls={}", prompt, imageUrls);
+            } else if (imageUrls != null && !imageUrls.isEmpty()) {
+                // 历史消息中已有当前prompt，但传入了新的imageUrls，应该使用传入的imageUrls
+                // 移除历史消息中的当前用户消息，重新添加带图片的消息
+                messages.removeIf(msg -> {
+                    if (msg instanceof UserMessage) {
+                        UserMessage userMsg = (UserMessage) msg;
+                        return prompt.equals(userMsg.getText());
+                    }
+                    return false;
+                });
+                messages.add(buildUserMessage(prompt, imageUrls));
+                log.info("📝 替换当前用户prompt（使用传入的imageUrls）: prompt={}, imageUrls={}", prompt, imageUrls);
+            } else {
+                log.info("⏭️ 跳过添加当前prompt（历史消息中已包含，且无新图片）: prompt={}", prompt);
+            }
+        }
+
+        log.info("🚀 开始流式调用模型: {}, 上下文消息数: {}, 当前prompt: {}", modelName, messages.size(), prompt);
+        
+        // 调用Spring AI流式API
+        String effectiveModelName = applyOnlineSuffixIfNeeded(modelName, webSearchEnabled);
+        OpenAiChatOptions.Builder optionsBuilder = OpenAiChatOptions.builder()
+                .model(effectiveModelName)
+                .temperature(ConversationConstant.DEFAULT_TEMPERATURE);
+        
+        Prompt chatPrompt = new Prompt(messages, optionsBuilder.build());
+        for (org.springframework.ai.chat.messages.Message message:messages){
+            log.info("messages == {}",JSONUtil.toJsonStr(message.getText()));
+
+        }
+
+        AtomicReference<Map<String, Object>> lastOutputMetadata = new AtomicReference<>();
+
+        // 使用chatModel.stream()直接获取流式响应（参考测试代码）
+        return chatModel.stream(chatPrompt)
+                .doOnNext(chatResponse -> {
+                    if (chatResponse.getResult() == null || chatResponse.getResult().getOutput() == null) {
+                        return;
+                    }
+                    String content = chatResponse.getResult().getOutput().getText();
+                    log.info("收到流式块: '{}' ({} 字符)", content, content != null ? content.length() : 0);
+                })
+                .map(chatResponse -> {
+                    String content = (chatResponse.getResult() != null && chatResponse.getResult().getOutput() != null)
+                            ? chatResponse.getResult().getOutput().getText()
+                            : null;
+                    // 安全处理 null 值，避免拼接出 "null" 字符串
+                    if (content != null && !content.isEmpty()) {
+                        fullContent.updateAndGet(prev -> prev + content);
+                    }
+                    // 提取思考过程（reasoning tokens）- 用于o1/DeepSeek R1等模型
+                    if (chatResponse.getResult() != null && chatResponse.getResult().getOutput() != null) {
+                        Map<String, Object> outputMetadata = chatResponse.getResult().getOutput().getMetadata();
+                        log.info("扩展数据: {}", outputMetadata);
+                        if (outputMetadata != null) {
+                            lastOutputMetadata.set(outputMetadata);
+
+                            // 提取reasoningContent
+                            if (outputMetadata.containsKey("reasoningContent")) {
+                                Object reasoningObj = outputMetadata.get("reasoningContent");
+                                if (reasoningObj != null) {
+                                    String reasoningContent = reasoningObj.toString();
+                                    reasoning.updateAndGet(prev -> prev + reasoningContent);
+                                }
+                            }
+                        }
+                    }
+
+                    if (chatResponse.getMetadata() != null && chatResponse.getMetadata().getUsage() != null) {
+                        Usage usage = chatResponse.getMetadata().getUsage();
+
+                        // 获取实际的prompt tokens（输入tokens）- Spring AI 1.1.2
+                        Integer promptTokens = usage.getPromptTokens();
+                        if (promptTokens != null) {
+                            inputTokens.set(promptTokens);
+                        }
+
+                        // 获取实际的completion tokens（输出tokens）- Spring AI 1.1.2
+                        Integer completionTokens = usage.getCompletionTokens();
+                        if (completionTokens != null) {
+                            outputTokens.set(completionTokens);
+                        }
+                    }
+
+                    // 构建SSE数据
+                    StreamChunkVO chunkVO = buildStreamChunk(
+                            conversationId,
+                            modelName,
+                            variantIndex,
+                            content,
+                            fullContent.get(),
+                            inputTokens.get(),
+                            outputTokens.get(),
+                            System.currentTimeMillis() - startTime.get(),
+                            null,
+                            null,
+                            false,
+                            reasoning.get(),
+                            fixedMessageIndex
+                    );
+
+                    log.debug("📤 发送SSE事件: model={}, contentLength={}, done=false",
+                            modelName, fullContent.get().length());
+
+                    return ServerSentEvent.<StreamChunkVO>builder()
+                            .data(chunkVO)
+                            .build();
+                })
+                .doOnNext(event -> log.debug("✅ SSE事件已发送: {}", event.data().getModelName()))
+                .concatWith(Mono.defer(() -> {
+                    // 流结束后保存消息
+                    long responseTimeMs = System.currentTimeMillis() - startTime.get();
+
+                    // 使用API返回的实际成本，如果没有则根据模型价格计算
+                    Double cost = totalCost.get();
+                    if (cost == null || cost == 0.0) {
+                        log.warn("API未返回cost，使用模型价格计算: {}", modelName);
+                        cost = calculateCostByModel(modelName, inputTokens.get(), outputTokens.get());
+                    }
+                    
+                    // 提取代码块并序列化为JSON
+                    String codeBlocksJson = null;
+                    if (fullContent.get() != null && !fullContent.get().isEmpty()) {
+                        List<CodeBlock> codeBlocks = CodeExtractor.extractCodeBlocks(fullContent.get());
+                        if (codeBlocks != null && !codeBlocks.isEmpty()) {
+                            codeBlocksJson = JSONUtil.toJsonStr(codeBlocks);
+                            log.info("保存代码块: 模型={}, 代码块数={}", modelName, codeBlocks.size());
+                        }
+                    }
+                    
+                    String toolsUsedJson = buildWebSearchToolsUsedJson(webSearchEnabled, prompt, fullContent.get(), lastOutputMetadata.get());
+
+                    saveAssistantMessage(
+                            conversationId,
+                            userId,
+                            modelName,
+                            prompt,
+                            fullContent.get(),
+                            variantIndex,
+                            (int) responseTimeMs,
+                            inputTokens.get(),
+                            outputTokens.get(),
+                            fixedMessageIndex,  // 传递固定的messageIndex
+                            reasoning.get(),  // 传递思考内容
+                            codeBlocksJson,  // 传递代码块JSON
+                            toolsUsedJson
+                    );
+
+                    // 发送完成事件
+                    int totalTokensValue = inputTokens.get() + outputTokens.get();
+                    StreamChunkVO doneVO = buildStreamChunk(
+                            conversationId,
+                            modelName,
+                            variantIndex,
+                            null,
+                            fullContent.get(),
+                            inputTokens.get(),
+                            outputTokens.get(),
+                            null,
+                            (int) responseTimeMs,
+                            cost,
+                            true,
+                            reasoning.get(),
+                            fixedMessageIndex
+                    );
+                    doneVO.setTotalTokens(totalTokensValue);
+                    doneVO.setToolsUsed(toolsUsedJson);
+
+                    log.info("🏁 {}响应完成: {} 字符, {} tokens",
+                            modelName, fullContent.get().length(), totalTokensValue);
+
+                    return Mono.just(ServerSentEvent.<StreamChunkVO>builder()
+                            .data(doneVO)
+                            .build());
+                }))
+                .doOnComplete(() -> log.info("✅ {}流完成", modelName))
+                .onErrorResume(error -> {
+                    // 捕获错误并返回错误信息（避免500错误）
+                    log.error("Model {} stream error: {}", modelName, error.getMessage(), error);
+
+                    String errorMessage = extractErrorMessage(error);
+                    StreamChunkVO errorVO = buildErrorChunk(
+                            conversationId,
+                            modelName,
+                            variantIndex,
+                            errorMessage,
+                            fixedMessageIndex
+                    );
+
+                    return Mono.just(ServerSentEvent.<StreamChunkVO>builder()
+                            .data(errorVO)
+                            .build());
+                });
+    }
+
+    /**
+     * 构建流式响应数据块
+     */
+    private StreamChunkVO buildStreamChunk(
+            String conversationId,
+            String modelName,
+            Integer variantIndex,
+            String content,
+            String fullContent,
+            Integer inputTokens,
+            Integer outputTokens,
+            Long elapsedMs,
+            Integer responseTimeMs,
+            Double cost,
+            Boolean done,
+            String reasoning,
+            Integer messageIndex
+    ) {
+        // 计算思考时间（秒）
+        Integer thinkingTime = null;
+        if (reasoning != null && !reasoning.isEmpty()) {
+            // 简单估算：每200个字符约1秒，最少1秒，最多60秒
+            thinkingTime = Math.max(1, Math.min(reasoning.length() / 200, 60));
+        }
+        
+        // 提取代码块（仅在完成时提取，避免流式过程中重复提取）
+        List<CodeBlock> codeBlocks = null;
+        Boolean hasCodeBlocks = false;
+        if (done != null && done && fullContent != null && !fullContent.isEmpty()) {
+            log.info("开始提取代码块，fullContent长度: {}", fullContent.length());
+            log.debug("fullContent内容: {}", fullContent.substring(0, Math.min(500, fullContent.length())));
+            
+            codeBlocks = CodeExtractor.extractCodeBlocks(fullContent);
+            
+            log.info("提取结果: codeBlocks={}, size={}", 
+                codeBlocks == null ? "null" : "not null", 
+                codeBlocks == null ? 0 : codeBlocks.size());
+            
+            hasCodeBlocks = codeBlocks != null && !codeBlocks.isEmpty();
+            if (hasCodeBlocks) {
+                log.info("从响应中提取到 {} 个代码块", codeBlocks.size());
+                for (int i = 0; i < codeBlocks.size(); i++) {
+                    CodeBlock block = codeBlocks.get(i);
+                    log.info("   代码块[{}]: language={}, codeLength={}", 
+                        i, block.getLanguage(), block.getCode() == null ? 0 : block.getCode().length());
+                }
+            } else {
+                log.warn("未提取到代码块！fullContent可能不包含```代码块格式");
+                log.debug("fullContent内容:\n{}", fullContent);
+            }
+        }
+        
+        StreamChunkVO chunkVO = StreamChunkVO.builder()
+                .conversationId(conversationId)
+                .modelName(modelName)
+                .variantIndex(variantIndex)
+                .content(content)
+                .fullContent(fullContent)
+                .inputTokens(inputTokens)
+                .outputTokens(outputTokens)
+                .elapsedMs(elapsedMs)
+                .responseTimeMs(responseTimeMs)
+                .cost(cost)
+                .done(done)
+                .reasoning(reasoning)
+                .hasReasoning(reasoning != null && !reasoning.isEmpty())
+                .thinkingTime(thinkingTime)
+                .messageIndex(messageIndex)
+                .codeBlocks(codeBlocks)
+                .hasCodeBlocks(hasCodeBlocks)
+                .build();
+        return chunkVO;
+    }
+
+    /**
+     * 保存用户消息
+     *
+     * @return 返回保存的消息的messageIndex
+     */
+    private int saveUserMessage(String conversationId, Long userId, String content) {
+        int messageIndex = getNextMessageIndex(conversationId);
+        return saveUserMessage(conversationId, userId, content, null, messageIndex, null);
+    }
+
+    private int saveUserMessage(String conversationId, Long userId, String content, List<String> imageUrls) {
+        int messageIndex = getNextMessageIndex(conversationId);
+        return saveUserMessage(conversationId, userId, content, imageUrls, messageIndex, null);
+    }
+
+    /**
+     * 保存用户消息（支持variantIndex）
+     *
+     * @return 返回保存的消息的messageIndex
+     */
+    private int saveUserMessage(String conversationId, Long userId, String content, int messageIndex, Integer variantIndex) {
+        return saveUserMessage(conversationId, userId, content, null, messageIndex, variantIndex);
+    }
+
+    private int saveUserMessage(String conversationId, Long userId, String content, List<String> imageUrls, int messageIndex, Integer variantIndex) {
+        ConversationMessage message = ConversationMessage.builder()
+                .id(IdUtil.randomUUID())
+                .conversationId(conversationId)
+                .userId(userId)
+                .messageIndex(messageIndex)
+                .role(MessageRoleEnum.USER.getValue())
+                .content(content)
+                .images(imageUrls == null || imageUrls.isEmpty() ? null : JSONUtil.toJsonStr(imageUrls))
+                .variantIndex(variantIndex)
+                .createTime(LocalDateTime.now())
+                .updateTime(LocalDateTime.now())
+                .isDelete(0)
+                .build();
+        conversationMessageMapper.insert(message);
+        return messageIndex;
+    }
+
+    private List<String> getVariantImagesSafe(List<List<String>> variantImageUrls, int index) {
+        if (variantImageUrls == null || variantImageUrls.size() <= index) {
+            return null;
+        }
+        return variantImageUrls.get(index);
+    }
+
+    private UserMessage buildUserMessage(String text, List<String> imageUrls) {
+        if (imageUrls == null || imageUrls.isEmpty()) {
+            log.debug("构建用户消息（无图片）: text={}", text);
+            return new UserMessage(text);
+        }
+        log.info("构建用户消息（包含 {} 张图片）: text={}, imageUrls={}", imageUrls.size(), text, imageUrls);
+        List<Media> mediaList = new ArrayList<>();
+        for (String url : imageUrls) {
+            if (url == null || url.trim().isEmpty()) {
+                log.warn("图片URL为空，跳过");
+                continue;
+            }
+            MimeType mimeType = guessImageMimeType(url);
+            try {
+                URI imageUri = URI.create(url);
+                Media media = new Media(mimeType, imageUri);
+                mediaList.add(media);
+                log.debug("添加图片Media: url={}, mimeType={}", url, mimeType);
+            } catch (Exception e) {
+                log.warn("构造图片URI失败，忽略该图片: url={}, error={}", url, e.getMessage());
+            }
+        }
+        if (mediaList.isEmpty()) {
+            log.warn("所有图片URL处理失败，使用纯文本消息");
+            return new UserMessage(text);
+        }
+        log.info("成功构建多模态用户消息: text={}, mediaCount={}", text, mediaList.size());
+        return UserMessage.builder()
+                .text(text)
+                .media(mediaList)
+                .build();
+    }
+
+    private UserMessage buildUserMessage(String text, String imagesJson) {
+        if (imagesJson == null || imagesJson.trim().isEmpty()) {
+            return new UserMessage(text);
+        }
+        List<String> urls;
+        try {
+            urls = JSONUtil.toList(imagesJson, String.class);
+        } catch (Exception e) {
+            log.warn("解析图片URL列表失败，忽略图片: {}", e.getMessage());
+            return new UserMessage(text);
+        }
+        return buildUserMessage(text, urls);
+    }
+
+    private MimeType guessImageMimeType(String url) {
+        String lower = url.toLowerCase();
+        if (lower.endsWith(".png")) {
+            return MimeTypeUtils.IMAGE_PNG;
+        }
+        if (lower.endsWith(".gif")) {
+            return MimeTypeUtils.IMAGE_GIF;
+        }
+        if (lower.endsWith(".webp")) {
+            return MimeTypeUtils.parseMimeType("image/webp");
+        }
+        return MimeTypeUtils.IMAGE_JPEG;
+    }
+
+    /**
+     * 如果启用联网搜索，则给模型追加 :online 后缀（避免重复追加）
+     */
+    private String applyOnlineSuffixIfNeeded(String modelName, Boolean webSearchEnabled) {
+        if (modelName == null) {
+            return null;
+        }
+        if (webSearchEnabled == null || !webSearchEnabled) {
+            return modelName;
+        }
+        // 已经包含 :online（例如 :free:online），则不重复追加
+        if (modelName.contains(ONLINE_SUFFIX)) {
+            return modelName;
+        }
+        return modelName + ONLINE_SUFFIX;
+    }
+
+    /**
+     * 构建联网搜索 toolsUsed JSON（用于入库与前端展示）
+     */
+    private String buildWebSearchToolsUsedJson(Boolean webSearchEnabled, String query, String fullContent, Map<String, Object> outputMetadata) {
+        if (webSearchEnabled == null || !webSearchEnabled) {
+            return null;
+        }
+        Map<String, Object> webSearch = new HashMap<>();
+        webSearch.put("enabled", true);
+        webSearch.put("query", query);
+        webSearch.put("engine", "auto");
+
+        List<String> sourceUrls = extractWebSourceUrls(outputMetadata, fullContent);
+        List<Map<String, String>> sources = new ArrayList<>();
+        for (String url : sourceUrls) {
+            Map<String, String> item = new HashMap<>();
+            item.put("url", url);
+            sources.add(item);
+        }
+        webSearch.put("sources", sources);
+
+        Map<String, Object> toolsUsed = new HashMap<>();
+        toolsUsed.put("webSearch", webSearch);
+        return JSONUtil.toJsonStr(toolsUsed);
+    }
+
+    /**
+     * 优先从 metadata.annotations 提取引用 URL；若没有则从文本中正则提取 URL
+     */
+    private List<String> extractWebSourceUrls(Map<String, Object> outputMetadata, String fullContent) {
+        LinkedHashSet<String> urls = new LinkedHashSet<>();
+        try {
+            if (outputMetadata != null && outputMetadata.containsKey("annotations")) {
+                Object annotationsObj = outputMetadata.get("annotations");
+                if (annotationsObj instanceof List<?> list) {
+                    for (Object item : list) {
+                        if (item instanceof Map<?, ?> map) {
+                            Object urlObj = map.get("url");
+                            if (urlObj != null) {
+                                String url = urlObj.toString();
+                                if (!url.isBlank()) {
+                                    urls.add(url);
+                                }
+                            }
+                        }
+                        if (urls.size() >= MAX_WEB_SOURCES) {
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("解析 outputMetadata.annotations 失败，降级为文本提取: {}", e.getMessage());
+        }
+
+        if (urls.isEmpty() && fullContent != null && !fullContent.isBlank()) {
+            Matcher matcher = URL_PATTERN.matcher(fullContent);
+            while (matcher.find()) {
+                urls.add(matcher.group());
+                if (urls.size() >= MAX_WEB_SOURCES) {
+                    break;
+                }
+            }
+        }
+        return new ArrayList<>(urls);
+    }
+
+    /**
+     * 保存助手消息
+     */
+    private void saveAssistantMessage(
+            String conversationId,
+            Long userId,
+            String modelName,
+            String prompt,
+            String content,
+            Integer variantIndex,
+            int responseTimeMs,
+            int inputTokens,
+            int outputTokens,
+            Integer fixedMessageIndex,  // 固定的messageIndex（可选）
+            String reasoning,  // 思考过程（可选）
+            String codeBlocks,  // 代码块JSON（可选）
+            String toolsUsed  // 工具调用信息（JSON，可选）
+    ) {
+        // 对于Prompt Lab，先保存用户的提示词变体
+        // 注意：在codeModePromptLabStream中，用户消息已经在调用createModelStreamWithSystemPrompt之前保存了
+        // 所以这里不再重复保存用户消息，避免重复
+        // 如果variantIndex不为null但fixedMessageIndex为null，说明是旧的Prompt Lab逻辑，需要保存用户消息
+        if (variantIndex != null && fixedMessageIndex == null) {
+            // 兼容旧逻辑：获取新的messageIndex（不推荐，会导致变体分散到不同的messageIndex）
+            int userMessageIndex = getNextMessageIndex(conversationId);
+            
+            ConversationMessage userMessage = ConversationMessage.builder()
+                    .id(IdUtil.randomUUID())
+                    .conversationId(conversationId)
+                    .userId(userId)
+                    .messageIndex(userMessageIndex)
+                    .role(MessageRoleEnum.USER.getValue())
+                    .content(prompt)  // 不再添加"变体X: "前缀，因为variantIndex字段已经标识了变体
+                    .variantIndex(variantIndex)  // 保存变体索引（用于Prompt Lab）
+                    .createTime(LocalDateTime.now())
+                    .updateTime(LocalDateTime.now())
+                    .isDelete(0)
+                    .build();
+            conversationMessageMapper.insert(userMessage);
+        }
+
+        // 保存助手消息
+        BigDecimal cost = BigDecimal.valueOf(calculateCostByModel(modelName, inputTokens, outputTokens));
+        // 使用固定的messageIndex（如果提供），否则获取下一个
+        int messageIndex = (fixedMessageIndex != null) ? fixedMessageIndex : getNextMessageIndex(conversationId);
+
+        // 记录思考内容日志
+        if (reasoning != null && !reasoning.isEmpty()) {
+            log.info("💾 保存思考内容: 模型={}, 长度={}", modelName, reasoning.length());
+        }
+
+        ConversationMessage message = ConversationMessage.builder()
+                .id(IdUtil.randomUUID())
+                .conversationId(conversationId)
+                .userId(userId)
+                .messageIndex(messageIndex)
+                .role(MessageRoleEnum.ASSISTANT.getValue())
+                .modelName(modelName)
+                .variantIndex(variantIndex)  // 保存变体索引（用于Prompt Lab）
+                .content(content)
+                .responseTimeMs(responseTimeMs)
+                .inputTokens(inputTokens)
+                .outputTokens(outputTokens)
+                .cost(cost)
+                .reasoning(reasoning)  // 保存思考内容
+                .codeBlocks(codeBlocks)  // 保存代码块JSON
+                .toolsUsed(toolsUsed)  // 保存工具调用信息
+                .createTime(LocalDateTime.now())
+                .updateTime(LocalDateTime.now())
+                .isDelete(0)
+                .build();
+        conversationMessageMapper.insert(message);
+
+        // 更新对话统计
+        updateConversationStats(conversationId, inputTokens + outputTokens, cost);
+
+        // 更新模型使用统计（全局）
+        modelService.updateModelUsage(modelName, inputTokens + outputTokens, cost);
+
+        // 更新用户-模型使用统计
+        Conversation conversation = conversationMapper.selectOneById(conversationId);
+        if (conversation != null && conversation.getUserId() != null) {
+            userModelUsageService.updateUserModelUsage(
+                    conversation.getUserId(),
+                    modelName,
+                    inputTokens + outputTokens,
+                    cost
+            );
+        }
+    }
+
+    /**
+     * 获取下一个消息序号
+     */
+    private int getNextMessageIndex(String conversationId) {
+        QueryWrapper wrapper = QueryWrapper.create()
+                .select("MAX(messageIndex)")
+                .from(ConversationMessage.class)
+                .where("conversationId = ?", conversationId);
+
+        Integer maxIndex = conversationMessageMapper.selectObjectByQueryAs(wrapper, Integer.class);
+        return maxIndex == null ? 0 : maxIndex + 1;
+    }
+    
+    /**
+     * 获取用于上下文的历史消息
+     * 
+     * @param conversationId 会话ID
+     * @param excludeMessageIndex 排除的messageIndex（当前正在创建的消息）
+     * @param variantIndex 变体索引（用于Prompt Lab模式，只加载当前变体的消息）
+     * @return 历史消息列表
+     */
+    private List<ConversationMessage> getHistoryMessagesForContext(String conversationId, Integer excludeMessageIndex, Integer variantIndex) {
+        QueryWrapper wrapper = QueryWrapper.create()
+                .from(ConversationMessage.class)
+                .where("conversationId = ? and isDelete = 0", conversationId);
+        
+        // 如果是Prompt Lab模式，只加载当前变体的消息
+        // 注意：为了兼容旧数据（variantIndex为null），我们加载所有消息，然后在后续处理中过滤
+        // 如果严格只加载当前变体，可以使用：wrapper.and("variantIndex = ?", variantIndex);
+        // 但为了兼容旧数据，我们暂时不在这里过滤，而是在后续处理中通过内容前缀判断
+        if (variantIndex != null) {
+            // 加载当前变体的消息，以及variantIndex为null的消息（旧数据兼容）
+            wrapper.and("(variantIndex = ? or variantIndex is null)", variantIndex);
+        }
+        
+        wrapper.orderBy("messageIndex", true);
+        
+        // 如果指定了排除的index，添加过滤条件
+        if (excludeMessageIndex != null) {
+            wrapper.and("messageIndex < ?", excludeMessageIndex);
+        }
+        
+        List<ConversationMessage> messages = conversationMessageMapper.selectListByQuery(wrapper);
+        log.info("📚 加载历史消息: 会话ID={}, variantIndex={}, 数量={}", conversationId, variantIndex, messages.size());
+        
+        return messages;
+    }
+
+    /**
+     * 更新对话统计信息
+     */
+    private void updateConversationStats(String conversationId, int tokens, BigDecimal cost) {
+        Conversation conversation = conversationMapper.selectOneById(conversationId);
+        if (conversation != null) {
+            conversation.setTotalTokens(
+                    (conversation.getTotalTokens() == null ? 0 : conversation.getTotalTokens()) + tokens
+            );
+            conversation.setTotalCost(
+                    (conversation.getTotalCost() == null ? BigDecimal.ZERO : conversation.getTotalCost()).add(cost)
+            );
+            conversation.setUpdateTime(LocalDateTime.now());
+            conversationMapper.update(conversation);
+        }
+    }
+
+    /**
+     * 根据模型实际价格计算成本（从数据库获取模型价格）
+     */
+    private Double calculateCostByModel(String modelId, int inputTokens, int outputTokens) {
+        try {
+            // 从数据库查询模型价格信息
+            com.yupi.template.model.entity.Model model = modelMapper.selectOneById(modelId);
+
+            if (model != null && model.getInputPrice() != null && model.getOutputPrice() != null) {
+                // 使用模型实际价格计算
+                double inputCost = (inputTokens / ConversationConstant.TOKENS_PER_MILLION) *
+                        model.getInputPrice().doubleValue();
+                double outputCost = (outputTokens / ConversationConstant.TOKENS_PER_MILLION) *
+                        model.getOutputPrice().doubleValue();
+                return inputCost + outputCost;
+            } else {
+                log.warn("模型{}价格信息不存在，使用默认价格", modelId);
+                return calculateCostWithDefaultPrice(inputTokens, outputTokens);
+            }
+        } catch (Exception e) {
+            log.error("查询模型{}价格失败，使用默认价格", modelId, e);
+            return calculateCostWithDefaultPrice(inputTokens, outputTokens);
+        }
+    }
+
+    /**
+     * 使用默认价格计算成本（降级方案）
+     */
+    private Double calculateCostWithDefaultPrice(int inputTokens, int outputTokens) {
+        double inputCost = (inputTokens / ConversationConstant.TOKENS_PER_MILLION) *
+                ConversationConstant.DEFAULT_INPUT_PRICE_PER_MILLION;
+        double outputCost = (outputTokens / ConversationConstant.TOKENS_PER_MILLION) *
+                ConversationConstant.DEFAULT_OUTPUT_PRICE_PER_MILLION;
+        return inputCost + outputCost;
+    }
+
+    /**
+     * 生成对话标题
+     */
+    private String generateTitle(String prompt) {
+        if (prompt.length() > ConversationConstant.MAX_TITLE_LENGTH) {
+            return prompt.substring(0, ConversationConstant.MAX_TITLE_LENGTH) + "...";
+        }
+        return prompt;
+    }
+
+    /**
+     * 从异常中提取错误信息（保留OpenRouter原始错误）
+     */
+    private String extractErrorMessage(Throwable error) {
+        if (error == null) {
+            return "未知错误";
+        }
+
+        String message = error.getMessage();
+        if (message == null || message.isEmpty()) {
+            message = error.getClass().getSimpleName();
+        }
+
+        // 添加友好提示，但保留原始错误信息
+        if (message.contains("401") || message.contains("Unauthorized")) {
+            return "API Key验证失败 - " + message;
+        }
+        if (message.contains("403") || message.contains("Forbidden")) {
+            return "权限不足或配额超限 - " + message;
+        }
+        if (message.contains("404") || message.contains("not found")) {
+            return message;
+        }
+        if (message.contains("429") || message.contains("rate limit")) {
+            return "请求频率超限 - " + message;
+        }
+        if (message.contains("timeout")) {
+            return "请求超时 - " + message;
+        }
+
+        // 直接返回原始错误信息
+        return message;
+    }
+
+    /**
+     * 构建错误响应
+     */
+    private StreamChunkVO buildErrorChunk(
+            String conversationId,
+            String modelName,
+            Integer variantIndex,
+            String errorMessage,
+            Integer messageIndex
+    ) {
+        return StreamChunkVO.builder()
+                .conversationId(conversationId)
+                .modelName(modelName)
+                .variantIndex(variantIndex)
+                .error(errorMessage)
+                .hasError(true)
+                .hasReasoning(false)
+                .done(true)
+                .messageIndex(messageIndex)
+                .build();
+    }
+}
