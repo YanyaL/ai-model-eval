@@ -36,7 +36,8 @@ spring:
   ai:
     openai:
       base-url: ${SPRING_AI_OPENAI_BASE_URL:https://openrouter.ai/api}
-      api-key: ${SPRING_AI_OPENAI_API_KEY:${OPENROUTER_API_KEY:}}
+      # Mock 阶段可用占位 Key；真实调用前再换成 OpenRouter Key
+      api-key: ${SPRING_AI_OPENAI_API_KEY:${OPENROUTER_API_KEY:sk-mock-disabled}}
       chat:
         options:
           model: ${SPRING_AI_DEFAULT_MODEL:qwen/qwen-plus}
@@ -45,6 +46,12 @@ spring:
   devtools:
     restart:
       enabled: true
+
+# 阶段2：默认开启 Mock，不调用真实大模型
+app:
+  ai:
+    mock-enabled: ${AI_MOCK_ENABLED:true}
+
 server:
   port: ${SERVER_PORT:8123}
   servlet:

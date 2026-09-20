@@ -12,8 +12,9 @@
 ## 上线前准备
 
 1. 安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)（Windows / Mac）或 Docker Engine（Linux）
-2. 申请 [OpenRouter API Key](https://openrouter.ai/keys)（必填，用于调用大模型）
-3. （可选）腾讯云 COS：需要图片上传 / 多模态时再配
+2. **现阶段默认 Mock AI**：可不填 OpenRouter Key，也能演示对比流式 UI（见 `.env` 中 `AI_MOCK_ENABLED=true`）
+3. 之后接真实模型时：申请 [OpenRouter API Key](https://openrouter.ai/keys)，填入 `.env`，并设 `AI_MOCK_ENABLED=false`
+4. （可选）腾讯云 COS：图片上传 / 多模态时再配
 
 ## 本地 / 服务器一键启动
 
@@ -23,7 +24,7 @@ cd "C:\AI model test"
 
 # 2. 准备环境变量
 copy .env.example .env
-# 用编辑器打开 .env，至少填写 OPENROUTER_API_KEY，并改掉默认弱密码
+# 改掉默认弱密码即可；大模型 Key 可后填
 
 # 3. 构建并启动
 docker compose up -d --build

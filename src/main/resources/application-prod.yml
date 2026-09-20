@@ -27,7 +27,7 @@ spring:
   ai:
     openai:
       base-url: ${SPRING_AI_OPENAI_BASE_URL:https://openrouter.ai/api}
-      api-key: ${SPRING_AI_OPENAI_API_KEY:${OPENROUTER_API_KEY}}
+      api-key: ${SPRING_AI_OPENAI_API_KEY:${OPENROUTER_API_KEY:sk-mock-disabled}}
       chat:
         options:
           model: ${SPRING_AI_DEFAULT_MODEL:qwen/qwen-plus}
@@ -36,6 +36,10 @@ spring:
   devtools:
     restart:
       enabled: false
+
+app:
+  ai:
+    mock-enabled: ${AI_MOCK_ENABLED:true}
 
 logging:
   level:
