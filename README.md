@@ -23,8 +23,11 @@ An enterprise-style AI model evaluation platform: side-by-side multi-model compa
 | 1 | 只保留 Java 后端，移除 Go / Python | 已完成 Done |
 | 2 | 无 API Key 的 Mock 演示模式 | 已完成 Done |
 | 3 | 本地上传（不依赖腾讯云 COS） | 已完成 Done |
-| 4 | 接入真实 OpenRouter（填 Key 即可 Live） | **本提交** In this commit |
-| 5 | 公网域名 + HTTPS | 待做 / Planned |
+| 4 | 接入真实 OpenRouter（填 Key 即可 Live） | 已完成 Done |
+| **M** | **最小可运行：Docker 起全套并打开页面** | **进行中 Now** |
+| 5 | 公网域名 + HTTPS | 跑通后再做 Later |
+
+**当前策略：** 功能骨架已齐（Mock 可演示），先把中间件栈跑起来做成「能打开、能登录、能 Mock 对话」的最小可用版本；确认无阻塞后再加 HTTPS / 真实 Key / 打磨。
 
 ---
 
