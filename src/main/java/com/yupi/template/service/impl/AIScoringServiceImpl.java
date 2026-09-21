@@ -79,11 +79,15 @@ public class AIScoringServiceImpl implements AIScoringService {
     @Resource
     private com.yupi.template.service.BudgetService budgetService;
 
+    @Resource
+    private com.yupi.template.service.AiModeService aiModeService;
+
     private static final int MAX_JUDGES = 3;
     private static final int MIN_JUDGES = 2;
 
     @Override
     public EvaluationResult score(String question, String modelResponse, Long userId) {
+        aiModeService.requireLiveApiKeyOrThrow();
         if (question == null || question.trim().isEmpty()) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "问题不能为空");
         }

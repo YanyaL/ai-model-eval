@@ -94,6 +94,9 @@ public class ConversationServiceImpl implements ConversationService {
     @Resource
     private com.yupi.template.service.UserModelUsageService userModelUsageService;
 
+    @Resource
+    private com.yupi.template.service.AiModeService aiModeService;
+
     @Override
     public String createConversation(CreateConversationRequest request, Long userId) {
         // 参数校验
@@ -137,6 +140,7 @@ public class ConversationServiceImpl implements ConversationService {
 
     @Override
     public Flux<ServerSentEvent<StreamChunkVO>> chatStream(ChatRequest request, Long userId) {
+        aiModeService.requireLiveApiKeyOrThrow();
         // 1. 参数校验
         ThrowUtils.throwIf(request == null, ErrorCode.PARAMS_ERROR);
         ThrowUtils.throwIf(request.getModel() == null || request.getModel().isEmpty(),
@@ -173,6 +177,7 @@ public class ConversationServiceImpl implements ConversationService {
 
     @Override
     public Flux<ServerSentEvent<StreamChunkVO>> sideBySideStream(SideBySideRequest request, Long userId) {
+        aiModeService.requireLiveApiKeyOrThrow();
         // 1. 参数校验
         validateSideBySideRequest(request);
         PromptGuardrail.validate(request.getPrompt());
@@ -229,6 +234,7 @@ public class ConversationServiceImpl implements ConversationService {
 
     @Override
     public Flux<ServerSentEvent<StreamChunkVO>> promptLabStream(PromptLabRequest request, Long userId) {
+        aiModeService.requireLiveApiKeyOrThrow();
         // 1. 参数校验
         validatePromptLabRequest(request);
         for (String v : request.getPromptVariants()) {
@@ -279,6 +285,7 @@ public class ConversationServiceImpl implements ConversationService {
 
     @Override
     public Flux<ServerSentEvent<StreamChunkVO>> codeModeStream(CodeModeRequest request, Long userId) {
+        aiModeService.requireLiveApiKeyOrThrow();
         // 1. 参数校验
         validateCodeModeRequest(request);
         PromptGuardrail.validate(request.getPrompt());
@@ -323,6 +330,7 @@ public class ConversationServiceImpl implements ConversationService {
 
     @Override
     public Flux<ServerSentEvent<StreamChunkVO>> battleStream(BattleRequest request, Long userId) {
+        aiModeService.requireLiveApiKeyOrThrow();
         // 1. 参数校验
         ThrowUtils.throwIf(request == null, ErrorCode.PARAMS_ERROR);
         ThrowUtils.throwIf(request.getPrompt() == null || request.getPrompt().trim().isEmpty(),
@@ -543,6 +551,7 @@ public class ConversationServiceImpl implements ConversationService {
 
     @Override
     public Flux<ServerSentEvent<StreamChunkVO>> codeModePromptLabStream(CodeModePromptLabRequest request, Long userId) {
+        aiModeService.requireLiveApiKeyOrThrow();
         // 1. 参数校验
         validateCodeModePromptLabRequest(request);
         for (String v : request.getPromptVariants()) {

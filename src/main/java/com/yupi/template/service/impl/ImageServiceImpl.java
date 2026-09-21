@@ -71,6 +71,9 @@ public class ImageServiceImpl implements ImageService {
     private TencentCosUtil tencentCosUtil;
 
     @Resource
+    private com.yupi.template.service.AiModeService aiModeService;
+
+    @Resource
     private ConversationMessageMapper conversationMessageMapper;
 
     @Resource
@@ -91,6 +94,11 @@ public class ImageServiceImpl implements ImageService {
 
     @Override
     public List<GeneratedImageVO> generateImages(GenerateImageRequest request, Long userId) {
+        if (aiModeService.isMockEnabled()) {
+            throw new BusinessException(ErrorCode.OPERATION_ERROR,
+                    "当前为 Mock 模式，图片生成需接入真实 OPENROUTER_API_KEY。请在 .env 配置 Key 并关闭 Mock。");
+        }
+        aiModeService.requireLiveApiKeyOrThrow();
         if (request == null) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "请求参数不能为空");
         }
@@ -329,6 +337,15 @@ public class ImageServiceImpl implements ImageService {
 
     @Override
     public Flux<ServerSentEvent<ImageStreamChunkVO>> generateImagesStream(GenerateImageRequest request, Long userId) {
+        if (aiModeService.isMockEnabled()) {
+            return Flux.error(new BusinessException(ErrorCode.OPERATION_ERROR,
+                    "当前为 Mock 模式，图片生成需接入真实 OPENROUTER_API_KEY。请在 .env 配置 Key 并关闭 Mock。"));
+        }
+        try {
+            aiModeService.requireLiveApiKeyOrThrow();
+        } catch (BusinessException e) {
+            return Flux.error(e);
+        }
         if (request == null) {
             return Flux.error(new BusinessException(ErrorCode.PARAMS_ERROR, "请求参数不能为空"));
         }

@@ -22,8 +22,8 @@ An enterprise-style AI model evaluation platform: side-by-side multi-model compa
 |------------|------------|-------------|
 | 1 | 只保留 Java 后端，移除 Go / Python | 已完成 Done |
 | 2 | 无 API Key 的 Mock 演示模式 | 已完成 Done |
-| 3 | 本地上传（不依赖腾讯云 COS） | **本提交** In this commit |
-| 4 | 接入真实 OpenRouter API Key | 最后做 / Last |
+| 3 | 本地上传（不依赖腾讯云 COS） | 已完成 Done |
+| 4 | 接入真实 OpenRouter（填 Key 即可 Live） | **本提交** In this commit |
 | 5 | 公网域名 + HTTPS | 待做 / Planned |
 
 ---
@@ -35,7 +35,7 @@ An enterprise-style AI model evaluation platform: side-by-side multi-model compa
 | 前端 Frontend (Vue 3) | 上游完整 Inherited | 本阶段未重写 UI |
 | 后端 Backend (Spring Boot) | 上游完整 Inherited | Java only |
 | 生产部署 Docker Compose | 已加固 Hardened | 见 DEPLOY.md |
-| OpenRouter API Key | 暂缓 Deferred | 默认 `AI_MOCK_ENABLED=true`，先 Mock 演示 |
+| OpenRouter API Key | 就绪 Ready | 填 `sk-or-...` 后自动/手动切 Live；状态见 `/api/system/ai-status` |
 
 ---
 

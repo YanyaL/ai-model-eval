@@ -68,8 +68,12 @@ public class PromptOptimizationServiceImpl implements PromptOptimizationService 
     @Resource
     private com.yupi.template.service.BudgetService budgetService;
 
+    @Resource
+    private com.yupi.template.service.AiModeService aiModeService;
+
     @Override
     public PromptOptimizationVO optimizePrompt(String originalPrompt, String aiResponse, String evaluationModel, Long userId) {
+        aiModeService.requireLiveApiKeyOrThrow();
         if (originalPrompt == null || originalPrompt.trim().isEmpty()) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "原始提示词不能为空");
         }

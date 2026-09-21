@@ -47,10 +47,8 @@ spring:
     restart:
       enabled: true
 
-# 阶段2/3：默认 Mock AI + 本地上传（不依赖真实 Key / COS）
+# 阶段3：本地上传；Mock/Live 由 AI_MOCK_ENABLED + OPENROUTER_API_KEY 自动判定（见 AiKeyUtils）
 app:
-  ai:
-    mock-enabled: ${AI_MOCK_ENABLED:true}
   storage:
     local-enabled: ${STORAGE_LOCAL_ENABLED:true}
     local-dir: ${STORAGE_LOCAL_DIR:./data/uploads}

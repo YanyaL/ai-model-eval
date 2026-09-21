@@ -37,11 +37,11 @@ public class SyncModelJob {
     @Resource
     private ModelService modelService;
 
+    @Resource
+    private com.yupi.template.service.AiModeService aiModeService;
+
     @Value("${spring.ai.openai.api-key:}")
     private String openRouterApiKey;
-
-    @Value("${app.ai.mock-enabled:true}")
-    private boolean mockEnabled;
 
     private static final String OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 
@@ -52,8 +52,7 @@ public class SyncModelJob {
      */
     @Scheduled(cron = "0 0 2 * * ?")
     public void syncModels() {
-        if (mockEnabled || openRouterApiKey == null || openRouterApiKey.isBlank()
-                || openRouterApiKey.contains("mock")) {
+        if (aiModeService.isMockEnabled() || !aiModeService.hasRealApiKey()) {
             log.info("跳过 OpenRouter 模型同步（Mock 模式或未配置真实 API Key），使用库内种子模型即可");
             return;
         }

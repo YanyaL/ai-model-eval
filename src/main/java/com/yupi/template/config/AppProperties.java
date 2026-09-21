@@ -15,13 +15,13 @@ public class AppProperties {
     private Ai ai = new Ai();
     private Storage storage = new Storage();
 
-    @Data
-    public static class Ai {
-        /**
-         * true：不调用 OpenRouter，返回可演示的模拟流式回答
-         */
-        private boolean mockEnabled = true;
-    }
+@Data
+public static class Ai {
+    /**
+     * 仅作文档占位；实际判定见 AiKeyUtils / AiModeService
+     */
+    private Boolean mockEnabled;
+}
 
     @Data
     public static class Storage {
