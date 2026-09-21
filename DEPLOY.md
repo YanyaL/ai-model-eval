@@ -13,8 +13,9 @@
 
 1. 安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)（Windows / Mac）或 Docker Engine（Linux）
 2. **现阶段默认 Mock AI**：可不填 OpenRouter Key，也能演示对比流式 UI（见 `.env` 中 `AI_MOCK_ENABLED=true`）
-3. 之后接真实模型时：申请 [OpenRouter API Key](https://openrouter.ai/keys)，填入 `.env`，并设 `AI_MOCK_ENABLED=false`
-4. （可选）腾讯云 COS：图片上传 / 多模态时再配
+3. **现阶段默认本地上传**：可不配腾讯云 COS，图片落到容器卷并通过 `/api/files/**` 访问
+4. 之后接真实模型时：申请 [OpenRouter API Key](https://openrouter.ai/keys)，填入 `.env`，并设 `AI_MOCK_ENABLED=false`
+5. （可选）腾讯云 COS：配置真实密钥后可将 `STORAGE_LOCAL_ENABLED=false` 切到云存储
 
 ## 本地 / 服务器一键启动
 

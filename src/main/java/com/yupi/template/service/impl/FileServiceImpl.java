@@ -18,7 +18,6 @@ import com.yupi.template.service.FileService;
 import com.yupi.template.utils.TencentCosUtil;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -39,9 +38,6 @@ public class FileServiceImpl implements FileService {
 
     @Resource
     private TencentCosUtil tencentCosManager;
-
-    @Value("${tencent.cos.host}")
-    private String cosHost;
 
     private static final long ONE_K = 1024L;
 
@@ -125,7 +121,7 @@ public class FileServiceImpl implements FileService {
             tencentCosManager.putObject(filepath, file);
 
             // 返回可访问地址
-            return cosHost + filepath;
+            return tencentCosManager.toPublicUrl(filepath);
         } catch (IOException e) {
             log.error("文件上传失败", e);
             throw new BusinessException(ErrorCode.SYSTEM_ERROR, "文件上传失败");
@@ -266,13 +262,12 @@ public class FileServiceImpl implements FileService {
             } else {
                 filepath = tencentCosManager.putObject(filepath, file, false, withWaterMark);
             }
-            return cosHost + filepath;
+            return tencentCosManager.toPublicUrl(filepath);
         } catch (Exception e) {
             log.error("文件上传失败", e);
             throw new BusinessException(ErrorCode.SYSTEM_ERROR, "压缩处理失败");
         }
     }
-
 
     /**
      * 校验 URL

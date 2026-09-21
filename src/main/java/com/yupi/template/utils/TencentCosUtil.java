@@ -13,6 +13,7 @@ import com.qcloud.cos.model.PutObjectResult;
 import com.qcloud.cos.model.ciModel.common.ImageProcessRequest;
 import com.qcloud.cos.model.ciModel.persistence.CIUploadResult;
 import com.qcloud.cos.model.ciModel.persistence.PicOperations;
+import com.yupi.template.config.AppProperties;
 import com.yupi.template.config.TencentCosConfig;
 import com.yupi.template.exception.BusinessException;
 import com.yupi.template.exception.ErrorCode;
@@ -22,18 +23,22 @@ import jakarta.validation.constraints.NotNull;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 import java.awt.image.BufferedImage;
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 
 /**
- * 操作 Tencent Cos 对象存储
- *
- * @author yupi
+ * 文件存储：优先腾讯云 COS；未配置时写入本地目录（配合 /api/files 访问）
  */
 @Slf4j
 @Component
@@ -43,15 +48,13 @@ public class TencentCosUtil {
     private TencentCosConfig tencentCosConfig;
 
     @Resource
-    private COSClient cosClient;
-    /**
-     * 1kb
-     */
+    private ObjectProvider<COSClient> cosClientProvider;
+
+    @Resource
+    private AppProperties appProperties;
+
     final long ONE_K = 1024L;
 
-    /**
-     * 支持生成缩略图的格式
-     */
     private final static HashSet<String> SUPPORT_THUMBNAIL_EXT = new HashSet<String>() {{
         add("jpg");
         add("jpeg");
@@ -62,26 +65,63 @@ public class TencentCosUtil {
         add("gif");
     }};
 
+    public boolean useLocalStorage() {
+        return appProperties.getStorage().isLocalEnabled()
+                || cosClientProvider.getIfAvailable() == null
+                || !tencentCosConfig.isConfigured();
+    }
+
+    private COSClient requireCosClient() {
+        COSClient client = cosClientProvider.getIfAvailable();
+        if (client == null) {
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "未配置腾讯云 COS");
+        }
+        return client;
+    }
+
+    private void saveLocal(String key, File file) {
+        try {
+            String normalized = StrUtil.removePrefix(key, "/");
+            Path target = Paths.get(appProperties.getStorage().getLocalDir(), normalized)
+                    .toAbsolutePath()
+                    .normalize();
+            Files.createDirectories(target.getParent());
+            Files.copy(file.toPath(), target, StandardCopyOption.REPLACE_EXISTING);
+            log.info("本地存储上传成功: {}", target);
+        } catch (IOException e) {
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "本地文件保存失败: " + e.getMessage());
+        }
+    }
+
     public PutObjectResult putObject(String key, String localFilePath) {
-        PutObjectRequest putObjectRequest = new PutObjectRequest(tencentCosConfig.getBucket(), key,
-                new File(localFilePath));
-        return cosClient.putObject(putObjectRequest);
+        File file = new File(localFilePath);
+        if (useLocalStorage()) {
+            saveLocal(key, file);
+            return null;
+        }
+        PutObjectRequest putObjectRequest = new PutObjectRequest(tencentCosConfig.getBucket(), key, file);
+        return requireCosClient().putObject(putObjectRequest);
     }
 
     public void deleteObject(String key) {
-        cosClient.deleteObject(tencentCosConfig.getBucket(), key);
+        if (useLocalStorage()) {
+            Path target = Paths.get(appProperties.getStorage().getLocalDir(), StrUtil.removePrefix(key, "/"))
+                    .toAbsolutePath().normalize();
+            FileUtil.del(target.toFile());
+            return;
+        }
+        requireCosClient().deleteObject(tencentCosConfig.getBucket(), key);
     }
 
     public PutObjectResult putObject(String key, File file) {
-        PutObjectRequest putObjectRequest = new PutObjectRequest(tencentCosConfig.getBucket(), key,
-                file);
-        return cosClient.putObject(putObjectRequest);
+        if (useLocalStorage()) {
+            saveLocal(key, file);
+            return null;
+        }
+        PutObjectRequest putObjectRequest = new PutObjectRequest(tencentCosConfig.getBucket(), key, file);
+        return requireCosClient().putObject(putObjectRequest);
     }
 
-
-    /**
-     * 构造缩略图的处理参数
-     */
     private @NotNull PicOperations getThumbnailPicOperations(String thumbnailKey, int width, int height) {
         PicOperations picOperations = new PicOperations();
         picOperations.setIsPicInfo(1);
@@ -90,28 +130,22 @@ public class TencentCosUtil {
         PicOperations.Rule rule1 = new PicOperations.Rule();
         rule1.setBucket(tencentCosConfig.getBucket());
         rule1.setFileId(thumbnailKey);
-        // 转成缩略图
-        // /thumbnail/<Width>x<Height>!
         rule1.setRule(String.format("imageMogr2/thumbnail/%sx%s!", width, height));
         ruleList.add(rule1);
         picOperations.setRules(ruleList);
         return picOperations;
     }
 
-    /**
-     * 对云上数据进行图片处理水印
-     *
-     * @param key            key
-     * @param waterMarkParam 水印参数
-     * @return {@link String}
-     */
     public String putObjectWithWaterMarkOnProcessImage(String key, WaterMarkParam waterMarkParam) {
         if (StrUtil.isBlank(key)) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "文件的 key 不能为空");
         }
+        if (useLocalStorage()) {
+            log.warn("本地存储模式不支持云端水印处理，原样返回 key={}", key);
+            return key;
+        }
         key = key.replace("https://pic.code-nav.cn", "");
         ImageProcessRequest imageReq = new ImageProcessRequest(tencentCosConfig.getBucket(), key);
-
 
         String ruleStr = "watermark/2/text/{encodedText}/font/{encodedFont}/fontsize/{fontSize}/fill/{encodedColor}/dissolve/{dissolve}/gravity/{gravity}/dx/{dx}/dy/{dy}/shadow/{shadow}";
         String formatRule = ruleStr.replace("{encodedText}", waterMarkParam.getEncodedText())
@@ -137,22 +171,12 @@ public class TencentCosUtil {
         picOperations.setIsPicInfo(0);
         picOperations.setRules(ruleList);
         imageReq.setPicOperations(picOperations);
-        CIUploadResult result = cosClient.processImage(imageReq);
+        CIUploadResult result = requireCosClient().processImage(imageReq);
         log.info("result {}", JSONUtil.toJsonStr(result));
 
         return key;
     }
 
-
-    /**
-     * 上传图片到腾讯云对象存储<br>
-     * 当图片参数<200*200时不加水印，避免影响图片清晰度<br>
-     * 否则加水印<br>
-     *
-     * @param key  key
-     * @param file 文件
-     * @return {@link String}
-     */
     public String uploadImage2Cos(String key, File file) {
         WaterMarkParam waterMarkParam = new WaterMarkParam(0.3d);
         BufferedImage bufferedImage = ImgUtil.read(file);
@@ -164,27 +188,18 @@ public class TencentCosUtil {
             log.info("图片宽高[{},{}]，加水印", bufferedImage.getWidth(), bufferedImage.getHeight());
             return putObjectWithWaterMark(key, file, waterMarkParam);
         }
-
     }
 
-
-    /**
-     * 上传带水印的图片
-     *      todo 可以调研在本地加水印然后上传，降低成本
-     *
-     * @param key            key
-     * @param file           文件
-     * @param waterMarkParam 水印参数
-     * @return {@link String}
-     */
     public String putObjectWithWaterMark(String key, File file, WaterMarkParam waterMarkParam) {
         if (StrUtil.isBlank(key)) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "文件的 key 不能为空");
         }
+        if (useLocalStorage()) {
+            saveLocal(key, file);
+            return key;
+        }
         key = StrUtil.prependIfMissing(key, "/");
-        PutObjectRequest putObjectRequest = new PutObjectRequest(tencentCosConfig.getBucket(), key,
-                file);
-
+        PutObjectRequest putObjectRequest = new PutObjectRequest(tencentCosConfig.getBucket(), key, file);
 
         String extName = FileUtil.extName(key);
         key = key.replace("." + extName, "_mianshiya." + extName);
@@ -198,7 +213,7 @@ public class TencentCosUtil {
         picOperations.setIsPicInfo(0);
         picOperations.setRules(ruleList);
         putObjectRequest.setPicOperations(picOperations);
-        cosClient.putObject(putObjectRequest);
+        requireCosClient().putObject(putObjectRequest);
 
         return key;
     }
@@ -216,8 +231,11 @@ public class TencentCosUtil {
     }
 
     public String putObject(String key, File file, boolean compress, boolean withWaterMark) {
-        PutObjectRequest putObjectRequest = new PutObjectRequest(tencentCosConfig.getBucket(), key,
-                file);
+        if (useLocalStorage()) {
+            saveLocal(key, file);
+            return key;
+        }
+        PutObjectRequest putObjectRequest = new PutObjectRequest(tencentCosConfig.getBucket(), key, file);
         String ext = CharSequenceUtil.subAfter(key, ".", true);
         String ruleStr = "";
 
@@ -232,13 +250,10 @@ public class TencentCosUtil {
             key = key.replace("." + extName, "_mianshiya." + extName);
         }
 
-        // 压缩逻辑，转成 webp 格式
         if (compress && SUPPORT_THUMBNAIL_EXT.contains(ext)) {
             ruleStr += "|" + "imageMogr2/format/webp";
-
         }
         if (StringUtils.isNotBlank(ruleStr)) {
-            // 规则不为空时执行图片操作
             PicOperations picOperations = new PicOperations();
             List<PicOperations.Rule> ruleList = new LinkedList<>();
             PicOperations.Rule rule = new PicOperations.Rule();
@@ -249,16 +264,32 @@ public class TencentCosUtil {
             picOperations.setRules(ruleList);
             putObjectRequest.setPicOperations(picOperations);
         }
-        cosClient.putObject(putObjectRequest);
+        requireCosClient().putObject(putObjectRequest);
         return key;
     }
 
     /**
-     * 获取水印规则
-     *
-     * @param waterMarkParam 水印参数
-     * @return {@link String }
+     * 本地：/api/files/...；COS：host + key
      */
+    public String toPublicUrl(String key) {
+        if (key == null) {
+            return null;
+        }
+        if (useLocalStorage()) {
+            String base = appProperties.getStorage().getPublicBaseUrl();
+            if (base == null || base.isBlank()) {
+                base = "/api/files";
+            }
+            if (base.endsWith("/")) {
+                base = base.substring(0, base.length() - 1);
+            }
+            String path = key.startsWith("/") ? key : "/" + key;
+            return base + path;
+        }
+        String host = tencentCosConfig.getHost();
+        return (host == null ? "" : host) + key;
+    }
+
     private String getWaterMarkRuleStr(WaterMarkParam waterMarkParam) {
         String ruleStr = "watermark/2/text/{encodedText}/font/{encodedFont}/fontsize/{fontSize}/fill/{encodedColor}/dissolve/{dissolve}/gravity/{gravity}/dx/{dx}/dy/{dy}/shadow/{shadow}";
         return ruleStr.replace("{encodedText}", waterMarkParam.getEncodedText())
@@ -271,6 +302,4 @@ public class TencentCosUtil {
                 .replace("{dy}", waterMarkParam.getDy())
                 .replace("{shadow}", waterMarkParam.getShadow());
     }
-
-
 }

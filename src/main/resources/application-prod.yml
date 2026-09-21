@@ -40,6 +40,10 @@ spring:
 app:
   ai:
     mock-enabled: ${AI_MOCK_ENABLED:true}
+  storage:
+    local-enabled: ${STORAGE_LOCAL_ENABLED:true}
+    local-dir: ${STORAGE_LOCAL_DIR:./data/uploads}
+    public-base-url: ${STORAGE_PUBLIC_BASE_URL:/api/files}
 
 logging:
   level:

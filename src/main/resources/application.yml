@@ -47,10 +47,14 @@ spring:
     restart:
       enabled: true
 
-# 阶段2：默认开启 Mock，不调用真实大模型
+# 阶段2/3：默认 Mock AI + 本地上传（不依赖真实 Key / COS）
 app:
   ai:
     mock-enabled: ${AI_MOCK_ENABLED:true}
+  storage:
+    local-enabled: ${STORAGE_LOCAL_ENABLED:true}
+    local-dir: ${STORAGE_LOCAL_DIR:./data/uploads}
+    public-base-url: ${STORAGE_PUBLIC_BASE_URL:/api/files}
 
 server:
   port: ${SERVER_PORT:8123}

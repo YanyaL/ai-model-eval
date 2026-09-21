@@ -58,9 +58,6 @@ public class ImageServiceImpl implements ImageService {
     @Value("${spring.ai.openai.api-key}")
     private String openRouterApiKey;
 
-    @Value("${tencent.cos.host}")
-    private String cosHost;
-
     @Resource
     private ModelService modelService;
 
@@ -539,7 +536,7 @@ public class ImageServiceImpl implements ImageService {
                 log.warn("临时图片删除失败: {}", tempFile.getAbsolutePath());
             }
 
-            return cosHost + storedKey;
+            return tencentCosUtil.toPublicUrl(storedKey);
         } catch (BusinessException e) {
             throw e;
         } catch (Exception e) {

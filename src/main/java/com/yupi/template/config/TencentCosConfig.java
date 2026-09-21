@@ -8,40 +8,33 @@ import com.qcloud.cos.region.Region;
 import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.util.StringUtils;
 
 @Configuration
 @ConfigurationProperties(prefix = "tencent.cos")
 @Data
 public class TencentCosConfig {
 
-    /**
-     * accessKey
-     */
     private String accessKey;
-
-    /**
-     * secretKey
-     */
     private String secretKey;
-
-    /**
-     * 区域
-     */
     private String region;
-
-    /**
-     * 桶名
-     */
     private String bucket;
+    private String host;
+
+    public boolean isConfigured() {
+        return StringUtils.hasText(accessKey)
+                && !"placeholder".equalsIgnoreCase(accessKey.trim())
+                && StringUtils.hasText(secretKey)
+                && !"placeholder".equalsIgnoreCase(secretKey.trim());
+    }
 
     @Bean
+    @Conditional(CosConfiguredCondition.class)
     public COSClient cosClient() {
-        // 初始化用户身份信息(secretId, secretKey)
         COSCredentials cred = new BasicCOSCredentials(accessKey, secretKey);
-        // 设置bucket的区域, COS地域的简称请参照 https://www.qcloud.com/document/product/436/6224
         ClientConfig clientConfig = new ClientConfig(new Region(region));
-        // 生成cos客户端
         return new COSClient(cred, clientConfig);
     }
 }
